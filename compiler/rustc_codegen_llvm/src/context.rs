@@ -71,7 +71,7 @@ pub struct CodegenCx<'ll, 'tcx> {
     pub statics_to_rauw: RefCell<Vec<(&'ll Value, &'ll Value)>>,
 
     /// Statics that will be placed in the llvm.used variable
-    /// See <http://llvm.org/docs/LangRef.html#the-llvm-used-global-variable> for details
+    /// See <https://llvm.org/docs/LangRef.html#the-llvm-used-global-variable> for details
     pub used_statics: RefCell<Vec<&'ll Value>>,
 
     pub lltypes: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), &'ll Type>>,
@@ -79,7 +79,7 @@ pub struct CodegenCx<'ll, 'tcx> {
     pub pointee_infos: RefCell<FxHashMap<(Ty<'tcx>, Size), Option<PointeeInfo>>>,
     pub isize_ty: &'ll Type,
 
-    pub coverage_cx: Option<coverageinfo::CrateCoverageContext<'tcx>>,
+    pub coverage_cx: Option<coverageinfo::CrateCoverageContext<'ll, 'tcx>>,
     pub dbg_cx: Option<debuginfo::CrateDebugContext<'ll, 'tcx>>,
 
     eh_personality: Cell<Option<&'ll Value>>,
@@ -101,10 +101,6 @@ fn to_llvm_tls_model(tls_model: TlsModel) -> llvm::ThreadLocalMode {
     }
 }
 
-fn strip_x86_address_spaces(data_layout: String) -> String {
-    data_layout.replace("-p270:32:32-p271:32:32-p272:64:64-", "-")
-}
-
 fn strip_powerpc64_vectors(data_layout: String) -> String {
     data_layout.replace("-v256:256:256-v512:512:512", "")
 }
@@ -119,11 +115,6 @@ pub unsafe fn create_module(
     let llmod = llvm::LLVMModuleCreateWithNameInContext(mod_name.as_ptr(), llcx);
 
     let mut target_data_layout = sess.target.data_layout.clone();
-    if llvm_util::get_version() < (10, 0, 0)
-        && (sess.target.arch == "x86" || sess.target.arch == "x86_64")
-    {
-        target_data_layout = strip_x86_address_spaces(target_data_layout);
-    }
     if llvm_util::get_version() < (12, 0, 0) && sess.target.arch == "powerpc64" {
         target_data_layout = strip_powerpc64_vectors(target_data_layout);
     }
@@ -280,7 +271,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
 
         let (llcx, llmod) = (&*llvm_module.llcx, llvm_module.llmod());
 
-        let coverage_cx = if tcx.sess.opts.debugging_opts.instrument_coverage {
+        let coverage_cx = if tcx.sess.instrument_coverage() {
             let covctx = coverageinfo::CrateCoverageContext::new();
             Some(covctx)
         } else {
@@ -331,7 +322,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     }
 
     #[inline]
-    pub fn coverage_context(&'a self) -> Option<&'a coverageinfo::CrateCoverageContext<'tcx>> {
+    pub fn coverage_context(&'a self) -> Option<&'a coverageinfo::CrateCoverageContext<'ll, 'tcx>> {
         self.coverage_cx.as_ref()
     }
 }
@@ -419,8 +410,8 @@ impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         &self.used_statics
     }
 
-    fn set_frame_pointer_elimination(&self, llfn: &'ll Value) {
-        attributes::set_frame_pointer_elimination(self, llfn)
+    fn set_frame_pointer_type(&self, llfn: &'ll Value) {
+        attributes::set_frame_pointer_type(self, llfn)
     }
 
     fn apply_target_cpu_attr(&self, llfn: &'ll Value) {
@@ -509,17 +500,10 @@ impl CodegenCx<'b, 'tcx> {
         let t_i32 = self.type_i32();
         let t_i64 = self.type_i64();
         let t_i128 = self.type_i128();
+        let t_isize = self.type_isize();
         let t_f32 = self.type_f32();
         let t_f64 = self.type_f64();
 
-        ifn!("llvm.wasm.trunc.saturate.unsigned.i32.f32", fn(t_f32) -> t_i32);
-        ifn!("llvm.wasm.trunc.saturate.unsigned.i32.f64", fn(t_f64) -> t_i32);
-        ifn!("llvm.wasm.trunc.saturate.unsigned.i64.f32", fn(t_f32) -> t_i64);
-        ifn!("llvm.wasm.trunc.saturate.unsigned.i64.f64", fn(t_f64) -> t_i64);
-        ifn!("llvm.wasm.trunc.saturate.signed.i32.f32", fn(t_f32) -> t_i32);
-        ifn!("llvm.wasm.trunc.saturate.signed.i32.f64", fn(t_f64) -> t_i32);
-        ifn!("llvm.wasm.trunc.saturate.signed.i64.f32", fn(t_f32) -> t_i64);
-        ifn!("llvm.wasm.trunc.saturate.signed.i64.f64", fn(t_f64) -> t_i64);
         ifn!("llvm.wasm.trunc.unsigned.i32.f32", fn(t_f32) -> t_i32);
         ifn!("llvm.wasm.trunc.unsigned.i32.f64", fn(t_f64) -> t_i32);
         ifn!("llvm.wasm.trunc.unsigned.i64.f32", fn(t_f32) -> t_i64);
@@ -528,6 +512,28 @@ impl CodegenCx<'b, 'tcx> {
         ifn!("llvm.wasm.trunc.signed.i32.f64", fn(t_f64) -> t_i32);
         ifn!("llvm.wasm.trunc.signed.i64.f32", fn(t_f32) -> t_i64);
         ifn!("llvm.wasm.trunc.signed.i64.f64", fn(t_f64) -> t_i64);
+
+        ifn!("llvm.fptosi.sat.i8.f32", fn(t_f32) -> t_i8);
+        ifn!("llvm.fptosi.sat.i16.f32", fn(t_f32) -> t_i16);
+        ifn!("llvm.fptosi.sat.i32.f32", fn(t_f32) -> t_i32);
+        ifn!("llvm.fptosi.sat.i64.f32", fn(t_f32) -> t_i64);
+        ifn!("llvm.fptosi.sat.i128.f32", fn(t_f32) -> t_i128);
+        ifn!("llvm.fptosi.sat.i8.f64", fn(t_f64) -> t_i8);
+        ifn!("llvm.fptosi.sat.i16.f64", fn(t_f64) -> t_i16);
+        ifn!("llvm.fptosi.sat.i32.f64", fn(t_f64) -> t_i32);
+        ifn!("llvm.fptosi.sat.i64.f64", fn(t_f64) -> t_i64);
+        ifn!("llvm.fptosi.sat.i128.f64", fn(t_f64) -> t_i128);
+
+        ifn!("llvm.fptoui.sat.i8.f32", fn(t_f32) -> t_i8);
+        ifn!("llvm.fptoui.sat.i16.f32", fn(t_f32) -> t_i16);
+        ifn!("llvm.fptoui.sat.i32.f32", fn(t_f32) -> t_i32);
+        ifn!("llvm.fptoui.sat.i64.f32", fn(t_f32) -> t_i64);
+        ifn!("llvm.fptoui.sat.i128.f32", fn(t_f32) -> t_i128);
+        ifn!("llvm.fptoui.sat.i8.f64", fn(t_f64) -> t_i8);
+        ifn!("llvm.fptoui.sat.i16.f64", fn(t_f64) -> t_i16);
+        ifn!("llvm.fptoui.sat.i32.f64", fn(t_f64) -> t_i32);
+        ifn!("llvm.fptoui.sat.i64.f64", fn(t_f64) -> t_i64);
+        ifn!("llvm.fptoui.sat.i128.f64", fn(t_f64) -> t_i128);
 
         ifn!("llvm.trap", fn() -> void);
         ifn!("llvm.debugtrap", fn() -> void);
@@ -707,12 +713,16 @@ impl CodegenCx<'b, 'tcx> {
         ifn!("llvm.assume", fn(i1) -> void);
         ifn!("llvm.prefetch", fn(i8p, t_i32, t_i32, t_i32) -> void);
 
+        // This isn't an "LLVM intrinsic", but LLVM's optimization passes
+        // recognize it like one and we assume it exists in `core::slice::cmp`
+        ifn!("memcmp", fn(i8p, i8p, t_isize) -> t_i32);
+
         // variadic intrinsics
         ifn!("llvm.va_start", fn(i8p) -> void);
         ifn!("llvm.va_end", fn(i8p) -> void);
         ifn!("llvm.va_copy", fn(i8p, i8p) -> void);
 
-        if self.sess().opts.debugging_opts.instrument_coverage {
+        if self.sess().instrument_coverage() {
             ifn!("llvm.instrprof.increment", fn(i8p, t_i64, t_i32, t_i32) -> void);
         }
 
@@ -760,18 +770,21 @@ impl<'b, 'tcx> CodegenCx<'b, 'tcx> {
 }
 
 impl HasDataLayout for CodegenCx<'ll, 'tcx> {
+    #[inline]
     fn data_layout(&self) -> &TargetDataLayout {
         &self.tcx.data_layout
     }
 }
 
 impl HasTargetSpec for CodegenCx<'ll, 'tcx> {
+    #[inline]
     fn target_spec(&self) -> &Target {
         &self.tcx.sess.target
     }
 }
 
 impl ty::layout::HasTyCtxt<'tcx> for CodegenCx<'ll, 'tcx> {
+    #[inline]
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }

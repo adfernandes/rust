@@ -4,7 +4,7 @@ use crate::transform::MirPass;
 use rustc_hir::Mutability;
 use rustc_middle::mir::{
     BinOp, Body, Constant, LocalDecls, Operand, Place, ProjectionElem, Rvalue, SourceInfo,
-    StatementKind,
+    StatementKind, UnOp,
 };
 use rustc_middle::ty::{self, TyCtxt};
 
@@ -47,28 +47,35 @@ impl<'tcx, 'a> InstCombineContext<'tcx, 'a> {
             Rvalue::BinaryOp(op @ (BinOp::Eq | BinOp::Ne), box (a, b)) => {
                 let new = match (op, self.try_eval_bool(a), self.try_eval_bool(b)) {
                     // Transform "Eq(a, true)" ==> "a"
-                    (BinOp::Eq, _, Some(true)) => Some(a.clone()),
+                    (BinOp::Eq, _, Some(true)) => Some(Rvalue::Use(a.clone())),
 
                     // Transform "Ne(a, false)" ==> "a"
-                    (BinOp::Ne, _, Some(false)) => Some(a.clone()),
+                    (BinOp::Ne, _, Some(false)) => Some(Rvalue::Use(a.clone())),
 
                     // Transform "Eq(true, b)" ==> "b"
-                    (BinOp::Eq, Some(true), _) => Some(b.clone()),
+                    (BinOp::Eq, Some(true), _) => Some(Rvalue::Use(b.clone())),
 
                     // Transform "Ne(false, b)" ==> "b"
-                    (BinOp::Ne, Some(false), _) => Some(b.clone()),
+                    (BinOp::Ne, Some(false), _) => Some(Rvalue::Use(b.clone())),
 
-                    // FIXME: Consider combining remaining comparisons into logical operations:
                     // Transform "Eq(false, b)" ==> "Not(b)"
+                    (BinOp::Eq, Some(false), _) => Some(Rvalue::UnaryOp(UnOp::Not, b.clone())),
+
                     // Transform "Ne(true, b)" ==> "Not(b)"
+                    (BinOp::Ne, Some(true), _) => Some(Rvalue::UnaryOp(UnOp::Not, b.clone())),
+
                     // Transform "Eq(a, false)" ==> "Not(a)"
+                    (BinOp::Eq, _, Some(false)) => Some(Rvalue::UnaryOp(UnOp::Not, a.clone())),
+
                     // Transform "Ne(a, true)" ==> "Not(a)"
+                    (BinOp::Ne, _, Some(true)) => Some(Rvalue::UnaryOp(UnOp::Not, a.clone())),
+
                     _ => None,
                 };
 
                 if let Some(new) = new {
                     if self.should_combine(source_info, rvalue) {
-                        *rvalue = Rvalue::Use(new);
+                        *rvalue = new;
                     }
                 }
             }
@@ -79,7 +86,7 @@ impl<'tcx, 'a> InstCombineContext<'tcx, 'a> {
 
     fn try_eval_bool(&self, a: &Operand<'_>) -> Option<bool> {
         let a = a.constant()?;
-        if a.literal.ty.is_bool() { a.literal.val.try_to_bool() } else { None }
+        if a.literal.ty().is_bool() { a.literal.try_to_bool() } else { None }
     }
 
     /// Transform "&(*a)" ==> "a".
@@ -110,12 +117,13 @@ impl<'tcx, 'a> InstCombineContext<'tcx, 'a> {
     fn combine_len(&self, source_info: &SourceInfo, rvalue: &mut Rvalue<'tcx>) {
         if let Rvalue::Len(ref place) = *rvalue {
             let place_ty = place.ty(self.local_decls, self.tcx).ty;
-            if let ty::Array(_, len) = place_ty.kind() {
+            if let ty::Array(_, len) = *place_ty.kind() {
                 if !self.should_combine(source_info, rvalue) {
                     return;
                 }
 
-                let constant = Constant { span: source_info.span, literal: len, user_ty: None };
+                let constant =
+                    Constant { span: source_info.span, literal: len.into(), user_ty: None };
                 *rvalue = Rvalue::Use(Operand::Constant(box constant));
             }
         }

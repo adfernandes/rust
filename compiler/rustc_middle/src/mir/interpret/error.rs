@@ -45,8 +45,8 @@ static_assert_size!(InterpErrorInfo<'_>, 8);
 
 /// Packages the kind of error we got from the const code interpreter
 /// up with a Rust-level backtrace of where the error occurred.
-/// Thsese should always be constructed by calling `.into()` on
-/// a `InterpError`. In `librustc_mir::interpret`, we have `throw_err_*`
+/// These should always be constructed by calling `.into()` on
+/// a `InterpError`. In `rustc_mir::interpret`, we have `throw_err_*`
 /// macros for this.
 #[derive(Debug)]
 pub struct InterpErrorInfo<'tcx>(Box<InterpErrorInfoInner<'tcx>>);
@@ -170,24 +170,25 @@ impl fmt::Display for InvalidProgramInfo<'_> {
 /// Details of why a pointer had to be in-bounds.
 #[derive(Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
 pub enum CheckInAllocMsg {
+    /// We are access memory.
     MemoryAccessTest,
-    NullPointerTest,
+    /// We are doing pointer arithmetic.
     PointerArithmeticTest,
+    /// None of the above -- generic/unspecific inbounds test.
     InboundsTest,
 }
 
 impl fmt::Display for CheckInAllocMsg {
     /// When this is printed as an error the context looks like this
-    /// "{test name} failed: pointer must be in-bounds at offset..."
+    /// "{msg}pointer must be in-bounds at offset..."
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",
             match *self {
-                CheckInAllocMsg::MemoryAccessTest => "memory access",
-                CheckInAllocMsg::NullPointerTest => "NULL pointer test",
-                CheckInAllocMsg::PointerArithmeticTest => "pointer arithmetic",
-                CheckInAllocMsg::InboundsTest => "inbounds test",
+                CheckInAllocMsg::MemoryAccessTest => "memory access failed: ",
+                CheckInAllocMsg::PointerArithmeticTest => "pointer arithmetic failed: ",
+                CheckInAllocMsg::InboundsTest => "",
             }
         )
     }
@@ -197,11 +198,11 @@ impl fmt::Display for CheckInAllocMsg {
 #[derive(Debug)]
 pub struct UninitBytesAccess {
     /// Location of the original memory access.
-    pub access_ptr: Pointer,
+    pub access_offset: Size,
     /// Size of the original memory access.
     pub access_size: Size,
     /// Location of the first uninitialized byte that was accessed.
-    pub uninit_ptr: Pointer,
+    pub uninit_offset: Size,
     /// Number of consecutive uninitialized bytes that were accessed.
     pub uninit_size: Size,
 }
@@ -226,7 +227,11 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     /// Invalid metadata in a wide pointer (using `str` to avoid allocations).
     InvalidMeta(&'static str),
     /// Invalid drop function in vtable.
-    InvalidDropFn(FnSig<'tcx>),
+    InvalidVtableDropFn(FnSig<'tcx>),
+    /// Invalid size in a vtable: too large.
+    InvalidVtableSize,
+    /// Invalid alignment in a vtable: too large, or not a power of 2.
+    InvalidVtableAlignment(String),
     /// Reading a C string that does not end within its allocation.
     UnterminatedCString(Pointer),
     /// Dereferencing a dangling pointer after it got freed.
@@ -251,7 +256,12 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     /// The value validity check found a problem.
     /// Should only be thrown by `validity.rs` and always point out which part of the value
     /// is the problem.
-    ValidationFailure(String),
+    ValidationFailure {
+        /// The "path" to the value in question, e.g. `.0[5].field` for a struct
+        /// field in the 6th element of an array that is the first element of a tuple.
+        path: Option<String>,
+        msg: String,
+    },
     /// Using a non-boolean `u8` as bool.
     InvalidBool(u8),
     /// Using a non-character `u32` as character.
@@ -263,7 +273,7 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     /// Using a string that is not valid UTF-8,
     InvalidStr(std::str::Utf8Error),
     /// Using uninitialized data where it is not allowed.
-    InvalidUninitBytes(Option<UninitBytesAccess>),
+    InvalidUninitBytes(Option<(AllocId, UninitBytesAccess)>),
     /// Working with a local that is not currently live.
     DeadLocal,
     /// Data size is not equal to target size.
@@ -286,11 +296,15 @@ impl fmt::Display for UndefinedBehaviorInfo<'_> {
             RemainderByZero => write!(f, "calculating the remainder with a divisor of zero"),
             PointerArithOverflow => write!(f, "overflowing in-bounds pointer arithmetic"),
             InvalidMeta(msg) => write!(f, "invalid metadata in wide pointer: {}", msg),
-            InvalidDropFn(sig) => write!(
+            InvalidVtableDropFn(sig) => write!(
                 f,
                 "invalid drop function signature: got {}, expected exactly one argument which must be a pointer type",
                 sig
             ),
+            InvalidVtableSize => {
+                write!(f, "invalid vtable: size is bigger than largest supported object")
+            }
+            InvalidVtableAlignment(msg) => write!(f, "invalid vtable: alignment {}", msg),
             UnterminatedCString(p) => write!(
                 f,
                 "reading a null-terminated string starting at {} with no null found before end of allocation",
@@ -301,18 +315,18 @@ impl fmt::Display for UndefinedBehaviorInfo<'_> {
             }
             PointerOutOfBounds { ptr, msg, allocation_size } => write!(
                 f,
-                "{} failed: pointer must be in-bounds at offset {}, \
+                "{}pointer must be in-bounds at offset {}, \
                            but is outside bounds of {} which has size {}",
                 msg,
                 ptr.offset.bytes(),
                 ptr.alloc_id,
                 allocation_size.bytes()
             ),
-            DanglingIntPointer(_, CheckInAllocMsg::NullPointerTest) => {
-                write!(f, "NULL pointer is not allowed for this operation")
+            DanglingIntPointer(0, CheckInAllocMsg::InboundsTest) => {
+                write!(f, "null pointer is not a valid pointer for this operation")
             }
             DanglingIntPointer(i, msg) => {
-                write!(f, "{} failed: 0x{:x} is not a valid pointer", msg, i)
+                write!(f, "{}0x{:x} is not a valid pointer", msg, i)
             }
             AlignmentCheckFailed { required, has } => write!(
                 f,
@@ -322,7 +336,10 @@ impl fmt::Display for UndefinedBehaviorInfo<'_> {
             ),
             WriteToReadOnly(a) => write!(f, "writing to {} which is read-only", a),
             DerefFunctionPointer(a) => write!(f, "accessing {} which contains a function", a),
-            ValidationFailure(ref err) => write!(f, "type validation failed: {}", err),
+            ValidationFailure { path: None, msg } => write!(f, "type validation failed: {}", msg),
+            ValidationFailure { path: Some(path), msg } => {
+                write!(f, "type validation failed at {}: {}", path, msg)
+            }
             InvalidBool(b) => {
                 write!(f, "interpreting an invalid 8-bit value as a bool: 0x{:02x}", b)
             }
@@ -334,18 +351,18 @@ impl fmt::Display for UndefinedBehaviorInfo<'_> {
                 write!(f, "using {} as function pointer but it does not point to a function", p)
             }
             InvalidStr(err) => write!(f, "this string is not valid UTF-8: {}", err),
-            InvalidUninitBytes(Some(access)) => write!(
+            InvalidUninitBytes(Some((alloc, access))) => write!(
                 f,
                 "reading {} byte{} of memory starting at {}, \
                  but {} byte{} {} uninitialized starting at {}, \
                  and this operation requires initialized memory",
                 access.access_size.bytes(),
                 pluralize!(access.access_size.bytes()),
-                access.access_ptr,
+                Pointer::new(*alloc, access.access_offset),
                 access.uninit_size.bytes(),
                 pluralize!(access.uninit_size.bytes()),
                 if access.uninit_size.bytes() != 1 { "are" } else { "is" },
-                access.uninit_ptr,
+                Pointer::new(*alloc, access.uninit_offset),
             ),
             InvalidUninitBytes(None) => write!(
                 f,
@@ -406,6 +423,8 @@ pub enum ResourceExhaustionInfo {
     ///
     /// The exact limit is set by the `const_eval_limit` attribute.
     StepLimitReached,
+    /// There is not enough memory to perform an allocation.
+    MemoryExhausted,
 }
 
 impl fmt::Display for ResourceExhaustionInfo {
@@ -417,6 +436,9 @@ impl fmt::Display for ResourceExhaustionInfo {
             }
             StepLimitReached => {
                 write!(f, "exceeded interpreter step limit (see `#[const_eval_limit]`)")
+            }
+            MemoryExhausted => {
+                write!(f, "tried to allocate more memory than available to compiler")
             }
         }
     }
@@ -434,8 +456,12 @@ impl<T: Any> AsAny for T {
 }
 
 /// A trait for machine-specific errors (or other "machine stop" conditions).
-pub trait MachineStopType: AsAny + fmt::Display + Send {}
-impl MachineStopType for String {}
+pub trait MachineStopType: AsAny + fmt::Display + Send {
+    /// If `true`, emit a hard error instead of going through the `CONST_ERR` lint
+    fn is_hard_err(&self) -> bool {
+        false
+    }
+}
 
 impl dyn MachineStopType {
     #[inline(always)]
@@ -445,7 +471,7 @@ impl dyn MachineStopType {
 }
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(InterpError<'_>, 72);
+static_assert_size!(InterpError<'_>, 64);
 
 pub enum InterpError<'tcx> {
     /// The program caused undefined behavior.
@@ -486,14 +512,26 @@ impl fmt::Debug for InterpError<'_> {
 }
 
 impl InterpError<'_> {
-    /// Some errors to string formatting even if the error is never printed.
+    /// Some errors do string formatting even if the error is never printed.
     /// To avoid performance issues, there are places where we want to be sure to never raise these formatting errors,
     /// so this method lets us detect them and `bug!` on unexpected errors.
     pub fn formatted_string(&self) -> bool {
         match self {
             InterpError::Unsupported(UnsupportedOpInfo::Unsupported(_))
-            | InterpError::UndefinedBehavior(UndefinedBehaviorInfo::ValidationFailure(_))
+            | InterpError::UndefinedBehavior(UndefinedBehaviorInfo::ValidationFailure { .. })
             | InterpError::UndefinedBehavior(UndefinedBehaviorInfo::Ub(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Should this error be reported as a hard error, preventing compilation, or a soft error,
+    /// causing a deny-by-default lint?
+    pub fn is_hard_err(&self) -> bool {
+        use InterpError::*;
+        match *self {
+            MachineStop(ref err) => err.is_hard_err(),
+            UndefinedBehavior(_) => true,
+            ResourceExhaustion(ResourceExhaustionInfo::MemoryExhausted) => true,
             _ => false,
         }
     }

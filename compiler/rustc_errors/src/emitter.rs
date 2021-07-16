@@ -9,7 +9,6 @@
 
 use Destination::*;
 
-use rustc_lint_defs::FutureBreakage;
 use rustc_span::source_map::SourceMap;
 use rustc_span::{MultiSpan, SourceFile, Span};
 
@@ -193,7 +192,10 @@ pub trait Emitter {
     /// other formats can, and will, simply ignore it.
     fn emit_artifact_notification(&mut self, _path: &Path, _artifact_type: &str) {}
 
-    fn emit_future_breakage_report(&mut self, _diags: Vec<(FutureBreakage, Diagnostic)>) {}
+    fn emit_future_breakage_report(&mut self, _diags: Vec<Diagnostic>) {}
+
+    /// Emit list of unused externs
+    fn emit_unused_externs(&mut self, _lint_level: &str, _unused_externs: &[&str]) {}
 
     /// Checks if should show explanations about "rustc --explain"
     fn should_show_explain(&self) -> bool {
@@ -306,7 +308,7 @@ pub trait Emitter {
                     // are some which do actually involve macros.
                     ExpnKind::Inlined | ExpnKind::Desugaring(..) | ExpnKind::AstPass(..) => None,
 
-                    ExpnKind::Macro(macro_kind, _) => Some(macro_kind),
+                    ExpnKind::Macro(macro_kind, name) => Some((macro_kind, name)),
                 }
             });
 
@@ -317,13 +319,12 @@ pub trait Emitter {
         self.render_multispans_macro_backtrace(span, children, backtrace);
 
         if !backtrace {
-            if let Some(macro_kind) = has_macro_spans {
+            if let Some((macro_kind, name)) = has_macro_spans {
+                let descr = macro_kind.descr();
+
                 let msg = format!(
-                    "this {} originates in {} {} \
+                    "this {level} originates in the {descr} `{name}` \
                     (in Nightly builds, run with -Z macro-backtrace for more info)",
-                    level,
-                    macro_kind.article(),
-                    macro_kind.descr(),
                 );
 
                 children.push(SubDiagnostic {
@@ -434,9 +435,15 @@ pub trait Emitter {
         span: &mut MultiSpan,
         children: &mut Vec<SubDiagnostic>,
     ) {
+        let source_map = if let Some(ref sm) = source_map {
+            sm
+        } else {
+            return;
+        };
         debug!("fix_multispans_in_extern_macros: before: span={:?} children={:?}", span, children);
-        for span in iter::once(&mut *span).chain(children.iter_mut().map(|child| &mut child.span)) {
-            self.fix_multispan_in_extern_macros(source_map, span);
+        self.fix_multispan_in_extern_macros(source_map, span);
+        for child in children.iter_mut() {
+            self.fix_multispan_in_extern_macros(source_map, &mut child.span);
         }
         debug!("fix_multispans_in_extern_macros: after: span={:?} children={:?}", span, children);
     }
@@ -444,16 +451,7 @@ pub trait Emitter {
     // This "fixes" MultiSpans that contain `Span`s pointing to locations inside of external macros.
     // Since these locations are often difficult to read,
     // we move these spans from the external macros to their corresponding use site.
-    fn fix_multispan_in_extern_macros(
-        &self,
-        source_map: &Option<Lrc<SourceMap>>,
-        span: &mut MultiSpan,
-    ) {
-        let sm = match source_map {
-            Some(ref sm) => sm,
-            None => return,
-        };
-
+    fn fix_multispan_in_extern_macros(&self, source_map: &Lrc<SourceMap>, span: &mut MultiSpan) {
         // First, find all the spans in external macros and point instead at their use site.
         let replacements: Vec<(Span, Span)> = span
             .primary_spans()
@@ -461,7 +459,7 @@ pub trait Emitter {
             .copied()
             .chain(span.span_labels().iter().map(|sp_label| sp_label.span))
             .filter_map(|sp| {
-                if !sp.is_dummy() && sm.is_imported(sp) {
+                if !sp.is_dummy() && source_map.is_imported(sp) {
                     let maybe_callsite = sp.source_callsite();
                     if sp != maybe_callsite {
                         return Some((sp, maybe_callsite));
@@ -1232,7 +1230,6 @@ impl EmitterWriter {
         is_secondary: bool,
     ) -> io::Result<()> {
         let mut buffer = StyledBuffer::new();
-        let header_style = if is_secondary { Style::HeaderMsg } else { Style::MainHeaderMsg };
 
         if !msp.has_primary_spans() && !msp.has_span_labels() && is_secondary && !self.short_message
         {
@@ -1257,11 +1254,12 @@ impl EmitterWriter {
                 buffer.append(0, &code, Style::Level(*level));
                 buffer.append(0, "]", Style::Level(*level));
             }
+            let header_style = if is_secondary { Style::HeaderMsg } else { Style::MainHeaderMsg };
             if *level != Level::FailureNote {
                 buffer.append(0, ": ", header_style);
             }
             for &(ref text, _) in msg.iter() {
-                buffer.append(0, text, header_style);
+                buffer.append(0, &replace_tabs(text), header_style);
             }
         }
 
@@ -1309,7 +1307,7 @@ impl EmitterWriter {
                         buffer_msg_line_offset,
                         &format!(
                             "{}:{}:{}",
-                            loc.file.name,
+                            loc.file.name.prefer_local(),
                             sm.doctest_offset_line(&loc.file.name, loc.line),
                             loc.col.0 + 1,
                         ),
@@ -1323,7 +1321,7 @@ impl EmitterWriter {
                         0,
                         &format!(
                             "{}:{}:{}: ",
-                            loc.file.name,
+                            loc.file.name.prefer_local(),
                             sm.doctest_offset_line(&loc.file.name, loc.line),
                             loc.col.0 + 1,
                         ),
@@ -1347,12 +1345,12 @@ impl EmitterWriter {
                     };
                     format!(
                         "{}:{}{}",
-                        annotated_file.file.name,
+                        annotated_file.file.name.prefer_local(),
                         sm.doctest_offset_line(&annotated_file.file.name, first_line.line_index),
                         col
                     )
                 } else {
-                    annotated_file.file.name.to_string()
+                    format!("{}", annotated_file.file.name.prefer_local())
                 };
                 buffer.append(buffer_msg_line_offset + 1, &loc, Style::LineAndColumn);
                 for _ in 0..max_line_num_len {
@@ -1470,9 +1468,7 @@ impl EmitterWriter {
                     let mut to_add = FxHashMap::default();
 
                     for (depth, style) in depths {
-                        if multilines.get(&depth).is_some() {
-                            multilines.remove(&depth);
-                        } else {
+                        if multilines.remove(&depth).is_none() {
                             to_add.insert(depth, style);
                         }
                     }
@@ -1726,14 +1722,13 @@ impl EmitterWriter {
                     if !self.short_message {
                         draw_col_separator_no_space(&mut buffer, 0, max_line_num_len + 1);
                     }
-                    match emit_to_destination(
+                    if let Err(e) = emit_to_destination(
                         &buffer.render(),
                         level,
                         &mut self.dst,
                         self.short_message,
                     ) {
-                        Ok(()) => (),
-                        Err(e) => panic!("failed to emit error: {}", e),
+                        panic!("failed to emit error: {}", e)
                     }
                 }
                 if !self.short_message {
@@ -2220,9 +2215,7 @@ pub fn is_case_difference(sm: &SourceMap, suggested: &str, sp: Span) -> bool {
     };
     let ascii_confusables = &['c', 'f', 'i', 'k', 'o', 's', 'u', 'v', 'w', 'x', 'y', 'z'];
     // All the chars that differ in capitalization are confusable (above):
-    let confusable = found
-        .chars()
-        .zip(suggested.chars())
+    let confusable = iter::zip(found.chars(), suggested.chars())
         .filter(|(f, s)| f != s)
         .all(|(f, s)| (ascii_confusables.contains(&f) || ascii_confusables.contains(&s)));
     confusable && found.to_lowercase() == suggested.to_lowercase()

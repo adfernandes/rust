@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::utils::{run_lints, span_lint};
+use clippy_utils::{diagnostics::span_lint, is_lint_allowed};
 use rustc_hir::{hir_id::CRATE_HIR_ID, Crate};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
@@ -19,11 +19,10 @@ declare_clippy_lint! {
     ///
     /// **Example:**
     /// ```toml
-    /// # This `Cargo.toml` is missing an authors field:
+    /// # This `Cargo.toml` is missing a description field:
     /// [package]
     /// name = "clippy"
     /// version = "0.0.212"
-    /// description = "A bunch of helpful lints to avoid common pitfalls in Rust"
     /// repository = "https://github.com/rust-lang/rust-clippy"
     /// readme = "README.md"
     /// license = "MIT OR Apache-2.0"
@@ -31,14 +30,13 @@ declare_clippy_lint! {
     /// categories = ["development-tools", "development-tools::cargo-plugins"]
     /// ```
     ///
-    /// Should include an authors field like:
+    /// Should include a description field like:
     ///
     /// ```toml
     /// # This `Cargo.toml` includes all common metadata
     /// [package]
     /// name = "clippy"
     /// version = "0.0.212"
-    /// authors = ["Someone <someone@rust-lang.org>"]
     /// description = "A bunch of helpful lints to avoid common pitfalls in Rust"
     /// repository = "https://github.com/rust-lang/rust-clippy"
     /// readme = "README.md"
@@ -86,7 +84,7 @@ fn is_empty_vec(value: &[String]) -> bool {
 
 impl LateLintPass<'_> for CargoCommonMetadata {
     fn check_crate(&mut self, cx: &LateContext<'_>, _: &Crate<'_>) {
-        if !run_lints(cx, &[CARGO_COMMON_METADATA], CRATE_HIR_ID) {
+        if is_lint_allowed(cx, CARGO_COMMON_METADATA, CRATE_HIR_ID) {
             return;
         }
 
@@ -96,10 +94,6 @@ impl LateLintPass<'_> for CargoCommonMetadata {
             // only run the lint if publish is `None` (`publish = true` or skipped entirely)
             // or if the vector isn't empty (`publish = ["something"]`)
             if package.publish.as_ref().filter(|publish| publish.is_empty()).is_none() || self.ignore_publish {
-                if is_empty_vec(&package.authors) {
-                    missing_warning(cx, &package, "package.authors");
-                }
-
                 if is_empty_str(&package.description) {
                     missing_warning(cx, &package, "package.description");
                 }

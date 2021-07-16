@@ -1,4 +1,6 @@
-#![deny(disjoint_capture_drop_reorder)]
+// run-rustfix
+
+#![deny(rust_2021_incompatible_closure_captures)]
 //~^ NOTE: the lint level is defined here
 
 #[derive(Debug)]
@@ -11,46 +13,26 @@ impl Drop for Foo {
 
 struct ConstainsDropField(Foo, Foo);
 
-#[derive(Debug)]
-struct ContainsAndImplsDrop(Foo);
-impl Drop for ContainsAndImplsDrop {
-    fn drop(&mut self) {
-        println!("{:?} dropped", self.0);
-    }
-}
-
-// Test that even if all paths starting at root variable that implement Drop are captured,
-// the lint is triggered if the root variable implements drop and isn't captured.
-fn test_precise_analysis_parent_root_impl_drop_not_captured() {
-    let t = ContainsAndImplsDrop(Foo(10));
-
-    let c = || {
-    //~^ERROR: drop order affected for closure because of `capture_disjoint_fields`
-    //~| NOTE: drop(&(t));
-        let _t = t.0;
-    };
-
-    c();
-}
-
 // Test that lint is triggered if a path that implements Drop is not captured by move
 fn test_precise_analysis_drop_paths_not_captured_by_move() {
     let t = ConstainsDropField(Foo(10), Foo(20));
 
     let c = || {
-    //~^ERROR: drop order affected for closure because of `capture_disjoint_fields`
-    //~| NOTE: drop(&(t));
+        //~^ ERROR: drop order
+        //~| NOTE: for more information, see
+        //~| HELP: add a dummy let to cause `t` to be fully captured
         let _t = t.0;
+        //~^ NOTE: in Rust 2018, closure captures all of `t`, but in Rust 2021, it only captures `t.0`
         let _t = &t.1;
     };
 
     c();
 }
+//~^ NOTE: in Rust 2018, `t` would be dropped here, but in Rust 2021, only `t.0` would be dropped here alongside the closure
 
 struct S;
 impl Drop for S {
-    fn drop(&mut self) {
-    }
+    fn drop(&mut self) {}
 }
 
 struct T(S, S);
@@ -61,18 +43,25 @@ fn test_precise_analysis_long_path_missing() {
     let u = U(T(S, S), T(S, S));
 
     let c = || {
-    //~^ERROR: drop order affected for closure because of `capture_disjoint_fields`
-    //~| NOTE: drop(&(u));
+        //~^ ERROR: drop order
+        //~| NOTE: for more information, see
+        //~| HELP: add a dummy let to cause `u` to be fully captured
         let _x = u.0.0;
+        //~^ NOTE: in Rust 2018, closure captures all of `u`, but in Rust 2021, it only captures `u.0.0`
         let _x = u.0.1;
+        //~^ NOTE: in Rust 2018, closure captures all of `u`, but in Rust 2021, it only captures `u.0.1`
         let _x = u.1.0;
+        //~^ NOTE: in Rust 2018, closure captures all of `u`, but in Rust 2021, it only captures `u.1.0`
     };
 
     c();
 }
+//~^ NOTE: in Rust 2018, `u` would be dropped here, but in Rust 2021, only `u.0.0` would be dropped here alongside the closure
+//~| NOTE: in Rust 2018, `u` would be dropped here, but in Rust 2021, only `u.0.1` would be dropped here alongside the closure
+//~| NOTE: in Rust 2018, `u` would be dropped here, but in Rust 2021, only `u.1.0` would be dropped here alongside the closure
+
 
 fn main() {
-    test_precise_analysis_parent_root_impl_drop_not_captured();
     test_precise_analysis_drop_paths_not_captured_by_move();
     test_precise_analysis_long_path_missing();
 }

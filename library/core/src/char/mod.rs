@@ -5,8 +5,8 @@
 //! scalar value]', which is similar to, but not the same as, a '[Unicode code
 //! point]'.
 //!
-//! [Unicode scalar value]: http://www.unicode.org/glossary/#unicode_scalar_value
-//! [Unicode code point]: http://www.unicode.org/glossary/#code_point
+//! [Unicode scalar value]: https://www.unicode.org/glossary/#unicode_scalar_value
+//! [Unicode code point]: https://www.unicode.org/glossary/#code_point
 //!
 //! This module exists for technical reasons, the primary documentation for
 //! `char` is directly on [the `char` primitive type][char] itself.
@@ -44,6 +44,8 @@ pub use self::methods::encode_utf8_raw;
 
 use crate::fmt::{self, Write};
 use crate::iter::FusedIterator;
+
+pub(crate) use self::methods::EscapeDebugExtArgs;
 
 // UTF-8 ranges and tags for encoding characters
 const TAG_CONT: u8 = 0b1000_0000;
@@ -93,8 +95,8 @@ const MAX_THREE_B: u32 = 0x10000;
 /// Point], but only ones within a certain range. `MAX` is the highest valid
 /// code point that's a valid [Unicode Scalar Value].
 ///
-/// [Unicode Scalar Value]: http://www.unicode.org/glossary/#unicode_scalar_value
-/// [Code Point]: http://www.unicode.org/glossary/#code_point
+/// [Unicode Scalar Value]: https://www.unicode.org/glossary/#unicode_scalar_value
+/// [Code Point]: https://www.unicode.org/glossary/#code_point
 #[stable(feature = "rust1", since = "1.0.0")]
 pub const MAX: char = char::MAX;
 

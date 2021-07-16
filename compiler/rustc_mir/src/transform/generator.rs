@@ -751,9 +751,10 @@ fn sanitize_witness<'tcx>(
             span_bug!(
                 body.span,
                 "Broken MIR: generator contains type {} in MIR, \
-                       but typeck only knows about {}",
-                decl.ty,
-                witness,
+                       but typeck only knows about {} and {:?}",
+                decl_ty,
+                allowed,
+                allowed_upvars
             );
         }
     }
@@ -963,7 +964,7 @@ fn create_generator_drop_shim<'tcx>(
 
     // Make sure we remove dead blocks to remove
     // unrelated code from the resume part of the function
-    simplify::remove_dead_blocks(&mut body);
+    simplify::remove_dead_blocks(tcx, &mut body);
 
     dump_mir(tcx, None, "generator_drop", &0, &body, |_, _| Ok(()));
 
@@ -989,7 +990,7 @@ fn insert_panic_block<'tcx>(
         cond: Operand::Constant(box Constant {
             span: body.span,
             user_ty: None,
-            literal: ty::Const::from_bool(tcx, false),
+            literal: ty::Const::from_bool(tcx, false).into(),
         }),
         expected: true,
         msg: message,
@@ -1136,7 +1137,7 @@ fn create_generator_resume_function<'tcx>(
 
     // Make sure we remove dead blocks to remove
     // unrelated code from the drop part of the function
-    simplify::remove_dead_blocks(body);
+    simplify::remove_dead_blocks(tcx, body);
 
     dump_mir(tcx, None, "generator_resume", &0, body, |_, _| Ok(()));
 }

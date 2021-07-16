@@ -29,12 +29,13 @@
 
 use crate::transform::MirPass;
 use rustc_index::vec::{Idx, IndexVec};
+use rustc_middle::mir::coverage::*;
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
-use rustc_middle::ty::ParamEnv;
 use rustc_middle::ty::TyCtxt;
 use smallvec::SmallVec;
-use std::{borrow::Cow, convert::TryInto};
+use std::borrow::Cow;
+use std::convert::TryInto;
 
 pub struct SimplifyCfg {
     label: String,
@@ -46,9 +47,9 @@ impl SimplifyCfg {
     }
 }
 
-pub fn simplify_cfg(body: &mut Body<'_>) {
+pub fn simplify_cfg(tcx: TyCtxt<'tcx>, body: &mut Body<'_>) {
     CfgSimplifier::new(body).simplify();
-    remove_dead_blocks(body);
+    remove_dead_blocks(tcx, body);
 
     // FIXME: Should probably be moved into some kind of pass manager
     body.basic_blocks_mut().raw.shrink_to_fit();
@@ -59,9 +60,9 @@ impl<'tcx> MirPass<'tcx> for SimplifyCfg {
         Cow::Borrowed(&self.label)
     }
 
-    fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         debug!("SimplifyCfg({:?}) - simplifying {:?}", self.label, body.source);
-        simplify_cfg(body);
+        simplify_cfg(tcx, body);
     }
 }
 
@@ -286,7 +287,7 @@ impl<'a, 'tcx> CfgSimplifier<'a, 'tcx> {
     }
 }
 
-pub fn remove_dead_blocks(body: &mut Body<'_>) {
+pub fn remove_dead_blocks(tcx: TyCtxt<'tcx>, body: &mut Body<'_>) {
     let reachable = traversal::reachable_as_bitset(body);
     let num_blocks = body.basic_blocks().len();
     if num_blocks == reachable.count() {
@@ -306,12 +307,86 @@ pub fn remove_dead_blocks(body: &mut Body<'_>) {
         }
         used_blocks += 1;
     }
+
+    if tcx.sess.instrument_coverage() {
+        save_unreachable_coverage(basic_blocks, used_blocks);
+    }
+
     basic_blocks.raw.truncate(used_blocks);
 
     for block in basic_blocks {
         for target in block.terminator_mut().successors_mut() {
             *target = replacements[target.index()];
         }
+    }
+}
+
+/// Some MIR transforms can determine at compile time that a sequences of
+/// statements will never be executed, so they can be dropped from the MIR.
+/// For example, an `if` or `else` block that is guaranteed to never be executed
+/// because its condition can be evaluated at compile time, such as by const
+/// evaluation: `if false { ... }`.
+///
+/// Those statements are bypassed by redirecting paths in the CFG around the
+/// `dead blocks`; but with `-Z instrument-coverage`, the dead blocks usually
+/// include `Coverage` statements representing the Rust source code regions to
+/// be counted at runtime. Without these `Coverage` statements, the regions are
+/// lost, and the Rust source code will show no coverage information.
+///
+/// What we want to show in a coverage report is the dead code with coverage
+/// counts of `0`. To do this, we need to save the code regions, by injecting
+/// `Unreachable` coverage statements. These are non-executable statements whose
+/// code regions are still recorded in the coverage map, representing regions
+/// with `0` executions.
+fn save_unreachable_coverage(
+    basic_blocks: &mut IndexVec<BasicBlock, BasicBlockData<'_>>,
+    first_dead_block: usize,
+) {
+    let has_live_counters = basic_blocks.raw[0..first_dead_block].iter().any(|live_block| {
+        live_block.statements.iter().any(|statement| {
+            if let StatementKind::Coverage(coverage) = &statement.kind {
+                matches!(coverage.kind, CoverageKind::Counter { .. })
+            } else {
+                false
+            }
+        })
+    });
+    if !has_live_counters {
+        // If there are no live `Counter` `Coverage` statements anymore, don't
+        // move dead coverage to the `START_BLOCK`. Just allow the dead
+        // `Coverage` statements to be dropped with the dead blocks.
+        //
+        // The `generator::StateTransform` MIR pass can create atypical
+        // conditions, where all live `Counter`s are dropped from the MIR.
+        //
+        // At least one Counter per function is required by LLVM (and necessary,
+        // to add the `function_hash` to the counter's call to the LLVM
+        // intrinsic `instrprof.increment()`).
+        return;
+    }
+
+    // Retain coverage info for dead blocks, so coverage reports will still
+    // report `0` executions for the uncovered code regions.
+    let mut dropped_coverage = Vec::new();
+    for dead_block in basic_blocks.raw[first_dead_block..].iter() {
+        for statement in dead_block.statements.iter() {
+            if let StatementKind::Coverage(coverage) = &statement.kind {
+                if let Some(code_region) = &coverage.code_region {
+                    dropped_coverage.push((statement.source_info, code_region.clone()));
+                }
+            }
+        }
+    }
+
+    let start_block = &mut basic_blocks[START_BLOCK];
+    for (source_info, code_region) in dropped_coverage {
+        start_block.statements.push(Statement {
+            source_info,
+            kind: StatementKind::Coverage(box Coverage {
+                kind: CoverageKind::Unreachable,
+                code_region: Some(code_region),
+            }),
+        })
     }
 }
 
@@ -326,7 +401,7 @@ impl<'tcx> MirPass<'tcx> for SimplifyLocals {
 
 pub fn simplify_locals<'tcx>(body: &mut Body<'tcx>, tcx: TyCtxt<'tcx>) {
     // First, we're going to get a count of *actual* uses for every `Local`.
-    let mut used_locals = UsedLocals::new(body, tcx);
+    let mut used_locals = UsedLocals::new(body);
 
     // Next, we're going to remove any `Local` with zero actual uses. When we remove those
     // `Locals`, we're also going to subtract any uses of other `Locals` from the `used_locals`
@@ -336,8 +411,7 @@ pub fn simplify_locals<'tcx>(body: &mut Body<'tcx>, tcx: TyCtxt<'tcx>) {
     remove_unused_definitions(&mut used_locals, body);
 
     // Finally, we'll actually do the work of shrinking `body.local_decls` and remapping the `Local`s.
-    let arg_count = body.arg_count.try_into().unwrap();
-    let map = make_local_map(&mut body.local_decls, &used_locals, arg_count);
+    let map = make_local_map(&mut body.local_decls, &used_locals);
 
     // Only bother running the `LocalUpdater` if we actually found locals to remove.
     if map.iter().any(Option::is_none) {
@@ -350,61 +424,54 @@ pub fn simplify_locals<'tcx>(body: &mut Body<'tcx>, tcx: TyCtxt<'tcx>) {
 }
 
 /// Construct the mapping while swapping out unused stuff out from the `vec`.
-fn make_local_map<'tcx, V>(
+fn make_local_map<V>(
     local_decls: &mut IndexVec<Local, V>,
-    used_locals: &UsedLocals<'tcx>,
-    arg_count: u32,
+    used_locals: &UsedLocals,
 ) -> IndexVec<Local, Option<Local>> {
-    let mut map: IndexVec<Local, Option<Local>> = IndexVec::from_elem(None, local_decls);
+    let mut map: IndexVec<Local, Option<Local>> = IndexVec::from_elem(None, &*local_decls);
     let mut used = Local::new(0);
 
     for alive_index in local_decls.indices() {
-        // When creating the local map treat the `RETURN_PLACE` and arguments as used.
-        if alive_index.as_u32() <= arg_count || used_locals.is_used(alive_index) {
-            map[alive_index] = Some(used);
-            if alive_index != used {
-                local_decls.swap(alive_index, used);
-            }
-            used.increment_by(1);
+        // `is_used` treats the `RETURN_PLACE` and arguments as used.
+        if !used_locals.is_used(alive_index) {
+            continue;
         }
+
+        map[alive_index] = Some(used);
+        if alive_index != used {
+            local_decls.swap(alive_index, used);
+        }
+        used.increment_by(1);
     }
     local_decls.truncate(used.index());
     map
 }
 
 /// Keeps track of used & unused locals.
-struct UsedLocals<'tcx> {
+struct UsedLocals {
     increment: bool,
+    arg_count: u32,
     use_count: IndexVec<Local, u32>,
-    is_static: bool,
-    local_decls: IndexVec<Local, LocalDecl<'tcx>>,
-    param_env: ParamEnv<'tcx>,
-    tcx: TyCtxt<'tcx>,
 }
 
-impl UsedLocals<'tcx> {
+impl UsedLocals {
     /// Determines which locals are used & unused in the given body.
-    fn new(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Self {
-        let def_id = body.source.def_id();
-        let is_static = tcx.is_static(def_id);
-        let param_env = tcx.param_env(def_id);
-        let local_decls = body.local_decls.clone();
+    fn new(body: &Body<'_>) -> Self {
         let mut this = Self {
             increment: true,
+            arg_count: body.arg_count.try_into().unwrap(),
             use_count: IndexVec::from_elem(0, &body.local_decls),
-            is_static,
-            local_decls,
-            param_env,
-            tcx,
         };
         this.visit_body(body);
         this
     }
 
     /// Checks if local is used.
+    ///
+    /// Return place and arguments are always considered used.
     fn is_used(&self, local: Local) -> bool {
         trace!("is_used({:?}): use_count: {:?}", local, self.use_count[local]);
-        self.use_count[local] != 0
+        local.as_u32() <= self.arg_count || self.use_count[local] != 0
     }
 
     /// Updates the use counts to reflect the removal of given statement.
@@ -422,7 +489,9 @@ impl UsedLocals<'tcx> {
             // A use, not a definition.
             self.visit_place(place, PlaceContext::MutatingUse(MutatingUseContext::Store), location);
         } else {
-            // A definition. Although, it still might use other locals for indexing.
+            // A definition. The base local itself is not visited, so this occurrence is not counted
+            // toward its use count. There might be other locals still, used in an indexing
+            // projection.
             self.super_projection(
                 place.as_ref(),
                 PlaceContext::MutatingUse(MutatingUseContext::Projection),
@@ -432,7 +501,7 @@ impl UsedLocals<'tcx> {
     }
 }
 
-impl Visitor<'tcx> for UsedLocals<'tcx> {
+impl Visitor<'_> for UsedLocals {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match statement.kind {
             StatementKind::LlvmInlineAsm(..)
@@ -459,21 +528,7 @@ impl Visitor<'tcx> for UsedLocals<'tcx> {
         }
     }
 
-    fn visit_local(&mut self, local: &Local, ctx: PlaceContext, _location: Location) {
-        debug!("local: {:?} is_static: {:?}, ctx: {:?}", local, self.is_static, ctx);
-        // Do not count _0 as a used in `return;` if it is a ZST.
-        let return_place = *local == RETURN_PLACE
-            && matches!(ctx, PlaceContext::NonMutatingUse(visit::NonMutatingUseContext::Move));
-        if !self.is_static && return_place {
-            let ty = self.local_decls[*local].ty;
-            let param_env_and = self.param_env.and(ty);
-            if let Ok(layout) = self.tcx.layout_of(param_env_and) {
-                debug!("layout.is_zst: {:?}", layout.is_zst());
-                if layout.is_zst() {
-                    return;
-                }
-            }
-        }
+    fn visit_local(&mut self, local: &Local, _ctx: PlaceContext, _location: Location) {
         if self.increment {
             self.use_count[*local] += 1;
         } else {
@@ -484,10 +539,7 @@ impl Visitor<'tcx> for UsedLocals<'tcx> {
 }
 
 /// Removes unused definitions. Updates the used locals to reflect the changes made.
-fn remove_unused_definitions<'a, 'tcx>(
-    used_locals: &'a mut UsedLocals<'tcx>,
-    body: &mut Body<'tcx>,
-) {
+fn remove_unused_definitions<'a, 'tcx>(used_locals: &'a mut UsedLocals, body: &mut Body<'tcx>) {
     // The use counts are updated as we remove the statements. A local might become unused
     // during the retain operation, leading to a temporary inconsistency (storage statements or
     // definitions referencing the local might remain). For correctness it is crucial that this

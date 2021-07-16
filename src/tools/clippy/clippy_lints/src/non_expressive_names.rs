@@ -1,4 +1,4 @@
-use crate::utils::{span_lint, span_lint_and_then};
+use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
 use rustc_ast::ast::{
     Arm, AssocItem, AssocItemKind, Attribute, Block, FnDecl, FnKind, Item, ItemKind, Local, Pat,
     PatKind,
@@ -126,6 +126,7 @@ const ALLOWED_TO_BE_SIMILAR: &[&[&str]] = &[
     &["args", "arms"],
     &["qpath", "path"],
     &["lit", "lint"],
+    &["wparam", "lparam"],
 ];
 
 struct SimilarNamesNameVisitor<'a, 'tcx, 'b>(&'b mut SimilarNamesLocalVisitor<'a, 'tcx>);
@@ -138,7 +139,7 @@ impl<'a, 'tcx, 'b> Visitor<'tcx> for SimilarNamesNameVisitor<'a, 'tcx, 'b> {
                     self.check_ident(ident);
                 }
             },
-            PatKind::Struct(_, ref fields, _) => {
+            PatKind::Struct(_, _, ref fields, _) => {
                 for field in fields {
                     if !field.is_shorthand {
                         self.visit_pat(&field.pat);

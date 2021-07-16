@@ -286,7 +286,6 @@ impl<'a, T> IterMut<'a, T> {
     /// Basic usage:
     ///
     /// ```
-    /// # #![feature(slice_iter_mut_as_slice)]
     /// let mut slice: &mut [usize] = &mut [1, 2, 3];
     ///
     /// // First, we get the iterator:
@@ -299,9 +298,16 @@ impl<'a, T> IterMut<'a, T> {
     /// // Now `as_slice` returns "[2, 3]":
     /// assert_eq!(iter.as_slice(), &[2, 3]);
     /// ```
-    #[unstable(feature = "slice_iter_mut_as_slice", reason = "recently added", issue = "58957")]
+    #[stable(feature = "slice_iter_mut_as_slice", since = "1.53.0")]
     pub fn as_slice(&self) -> &[T] {
         self.make_slice()
+    }
+}
+
+#[stable(feature = "slice_iter_mut_as_slice", since = "1.53.0")]
+impl<T> AsRef<[T]> for IterMut<'_, T> {
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
     }
 }
 
@@ -335,9 +341,11 @@ pub struct Split<'a, T: 'a, P>
 where
     P: FnMut(&T) -> bool,
 {
-    v: &'a [T],
+    // Used for `SplitWhitespace` and `SplitAsciiWhitespace` `as_str` methods
+    pub(crate) v: &'a [T],
     pred: P,
-    finished: bool,
+    // Used for `SplitAsciiWhitespace` `as_str` method
+    pub(crate) finished: bool,
 }
 
 impl<'a, T: 'a, P: FnMut(&T) -> bool> Split<'a, T, P> {
@@ -1410,18 +1418,17 @@ impl<'a, T> Iterator for Chunks<'a, T> {
     #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> Self::Item {
         let start = idx * self.chunk_size;
-        let end = match start.checked_add(self.chunk_size) {
-            None => self.v.len(),
-            Some(end) => cmp::min(end, self.v.len()),
-        };
         // SAFETY: the caller guarantees that `i` is in bounds,
         // which means that `start` must be in bounds of the
-        // underlying `self.v` slice, and we made sure that `end`
+        // underlying `self.v` slice, and we made sure that `len`
         // is also in bounds of `self.v`. Thus, `start` cannot overflow
         // an `isize`, and the slice constructed by `from_raw_parts`
         // is a subslice of `self.v` which is guaranteed to be valid
         // for the lifetime `'a` of `self.v`.
-        unsafe { from_raw_parts(self.v.as_ptr().add(start), end - start) }
+        unsafe {
+            let len = cmp::min(self.v.len().unchecked_sub(start), self.chunk_size);
+            from_raw_parts(self.v.as_ptr().add(start), len)
+        }
     }
 }
 
@@ -1449,7 +1456,7 @@ impl<'a, T> DoubleEndedIterator for Chunks<'a, T> {
         } else {
             let start = (len - 1 - n) * self.chunk_size;
             let end = match start.checked_add(self.chunk_size) {
-                Some(res) => cmp::min(res, self.v.len()),
+                Some(res) => cmp::min(self.v.len(), res),
                 None => self.v.len(),
             };
             let nth_back = &self.v[start..end];
@@ -1571,17 +1578,16 @@ impl<'a, T> Iterator for ChunksMut<'a, T> {
     #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> Self::Item {
         let start = idx * self.chunk_size;
-        let end = match start.checked_add(self.chunk_size) {
-            None => self.v.len(),
-            Some(end) => cmp::min(end, self.v.len()),
-        };
         // SAFETY: see comments for `Chunks::__iterator_get_unchecked`.
         //
         // Also note that the caller also guarantees that we're never called
         // with the same index again, and that no other methods that will
         // access this subslice are called, so it is valid for the returned
         // slice to be mutable.
-        unsafe { from_raw_parts_mut(self.v.as_mut_ptr().add(start), end - start) }
+        unsafe {
+            let len = cmp::min(self.v.len().unchecked_sub(start), self.chunk_size);
+            from_raw_parts_mut(self.v.as_mut_ptr().add(start), len)
+        }
     }
 }
 
@@ -1611,7 +1617,7 @@ impl<'a, T> DoubleEndedIterator for ChunksMut<'a, T> {
         } else {
             let start = (len - 1 - n) * self.chunk_size;
             let end = match start.checked_add(self.chunk_size) {
-                Some(res) => cmp::min(res, self.v.len()),
+                Some(res) => cmp::min(self.v.len(), res),
                 None => self.v.len(),
             };
             let (temp, _tail) = mem::replace(&mut self.v, &mut []).split_at_mut(end);
@@ -2140,6 +2146,7 @@ impl<'a, T, const N: usize> Iterator for ArrayChunks<'a, T, N> {
         self.iter.last()
     }
 
+    #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, i: usize) -> &'a [T; N] {
         // SAFETY: The safety guarantees of `__iterator_get_unchecked` are
         // transferred to the caller.
@@ -2252,6 +2259,7 @@ impl<'a, T, const N: usize> Iterator for ArrayChunksMut<'a, T, N> {
         self.iter.last()
     }
 
+    #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, i: usize) -> &'a mut [T; N] {
         // SAFETY: The safety guarantees of `__iterator_get_unchecked` are transferred to
         // the caller.

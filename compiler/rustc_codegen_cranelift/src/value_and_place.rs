@@ -2,7 +2,6 @@
 
 use crate::prelude::*;
 
-use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::immediates::Offset32;
 
 fn codegen_field<'tcx>(
@@ -414,7 +413,7 @@ impl<'tcx> CPlace<'tcx> {
         self,
         fx: &mut FunctionCx<'_, '_, 'tcx>,
         from: CValue<'tcx>,
-        #[cfg_attr(not(debug_assertions), allow(unused_variables))] method: &'static str,
+        method: &'static str,
     ) {
         fn transmute_value<'tcx>(
             fx: &mut FunctionCx<'_, '_, 'tcx>,
@@ -454,6 +453,10 @@ impl<'tcx> CPlace<'tcx> {
                     ptr.store(fx, data, MemFlags::trusted());
                     ptr.load(fx, dst_ty, MemFlags::trusted())
                 }
+
+                // `CValue`s should never contain SSA-only types, so if you ended
+                // up here having seen an error like `B1 -> I8`, then before
+                // calling `write_cvalue` you need to add a `bint` instruction.
                 _ => unreachable!("write_cvalue_transmute: {:?} -> {:?}", src_ty, dst_ty),
             };
             //fx.bcx.set_val_label(data, cranelift_codegen::ir::ValueLabel::new(var.index()));
@@ -462,8 +465,7 @@ impl<'tcx> CPlace<'tcx> {
 
         assert_eq!(self.layout().size, from.layout().size);
 
-        #[cfg(debug_assertions)]
-        {
+        if fx.clif_comments.enabled() {
             use cranelift_codegen::cursor::{Cursor, CursorPosition};
             let cur_block = match fx.bcx.cursor().position() {
                 CursorPosition::After(block) => block,
@@ -556,13 +558,14 @@ impl<'tcx> CPlace<'tcx> {
                 let src_align = src_layout.align.abi.bytes() as u8;
                 let dst_align = dst_layout.align.abi.bytes() as u8;
                 fx.bcx.emit_small_memory_copy(
-                    fx.cx.module.target_config(),
+                    fx.module.target_config(),
                     to_addr,
                     from_addr,
                     size,
                     dst_align,
                     src_align,
                     true,
+                    MemFlags::trusted(),
                 );
             }
             CValueInner::ByRef(_, Some(_)) => todo!(),
@@ -706,6 +709,19 @@ pub(crate) fn assert_assignable<'tcx>(
                 );
             }
             // dyn for<'r> Trait<'r> -> dyn Trait<'_> is allowed
+        }
+        (&ty::Adt(adt_def_a, substs_a), &ty::Adt(adt_def_b, substs_b))
+            if adt_def_a.did == adt_def_b.did =>
+        {
+            let mut types_a = substs_a.types();
+            let mut types_b = substs_b.types();
+            loop {
+                match (types_a.next(), types_b.next()) {
+                    (Some(a), Some(b)) => assert_assignable(fx, a, b),
+                    (None, None) => return,
+                    (Some(_), None) | (None, Some(_)) => panic!("{:#?}/{:#?}", from_ty, to_ty),
+                }
+            }
         }
         _ => {
             assert_eq!(

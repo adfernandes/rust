@@ -1,5 +1,4 @@
 // aux-build:deprecation-lint.rs
-// ignore-tidy-linelength
 
 #![deny(deprecated)]
 #![allow(warnings)]
@@ -430,6 +429,24 @@ mod this_crate2 {
         //~^ ERROR use of deprecated tuple struct `this_crate2::Deprecated2`: text
             // the patterns are all fine:
             (..) = x;
+    }
+
+    #[derive(Debug)]
+    #[deprecated(note = "Use something else instead")]
+    enum DeprecatedDebugEnum {
+        Variant1 { value: Option<String> },
+    }
+
+    #[allow(deprecated)]
+    impl DeprecatedDebugEnum {
+        fn new() -> Self {
+            DeprecatedDebugEnum::Variant1 { value: None }
+        }
+    }
+
+    #[allow(deprecated)]
+    pub fn allow_dep() {
+        let _ = DeprecatedDebugEnum::new();
     }
 }
 

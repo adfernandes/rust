@@ -1,3 +1,4 @@
+// ignore-tidy-filelength
 use crate::ich::StableHashingContext;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::mir::{GeneratorLayout, GeneratorSavedLocal};
@@ -11,7 +12,7 @@ use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
 use rustc_index::bit_set::BitSet;
 use rustc_index::vec::{Idx, IndexVec};
-use rustc_session::{DataTypeKind, FieldInfo, SizeKind, VariantInfo};
+use rustc_session::{config::OptLevel, DataTypeKind, FieldInfo, SizeKind, VariantInfo};
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::DUMMY_SP;
 use rustc_target::abi::call::{
@@ -220,7 +221,7 @@ fn layout_raw<'tcx>(
     ty::tls::with_related_context(tcx, move |icx| {
         let (param_env, ty) = query.into_parts();
 
-        if !tcx.sess.recursion_limit().value_within_limit(icx.layout_depth) {
+        if !tcx.recursion_limit().value_within_limit(icx.layout_depth) {
             tcx.sess.fatal(&format!("overflow representing the type `{}`", ty));
         }
 
@@ -311,7 +312,8 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
         let dl = self.data_layout();
         let pack = repr.pack;
         if pack.is_some() && repr.align.is_some() {
-            bug!("struct cannot be packed and aligned");
+            self.tcx.sess.delay_span_bug(DUMMY_SP, "struct cannot be packed and aligned");
+            return Err(LayoutError::Unknown(ty));
         }
 
         let mut align = if pack.is_some() { dl.i8_align } else { dl.aggregate_align };
@@ -366,7 +368,14 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
         for &i in &inverse_memory_index {
             let field = fields[i as usize];
             if !sized {
-                bug!("univariant: field #{} of `{}` comes after unsized field", offsets.len(), ty);
+                self.tcx.sess.delay_span_bug(
+                    DUMMY_SP,
+                    &format!(
+                        "univariant: field #{} of `{}` comes after unsized field",
+                        offsets.len(),
+                        ty
+                    ),
+                );
             }
 
             if field.is_unsized() {
@@ -664,6 +673,15 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
 
             // SIMD vector types.
             ty::Adt(def, substs) if def.repr.simd() => {
+                if !def.is_struct() {
+                    // Should have yielded E0517 by now.
+                    tcx.sess.delay_span_bug(
+                        DUMMY_SP,
+                        "#[repr(simd)] was applied to an ADT that is not a struct",
+                    );
+                    return Err(LayoutError::Unknown(ty));
+                }
+
                 // Supported SIMD vectors are homogeneous ADTs with at least one field:
                 //
                 // * #[repr(simd)] struct S(T, T, T, T);
@@ -791,7 +809,11 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
 
                 if def.is_union() {
                     if def.repr.pack.is_some() && def.repr.align.is_some() {
-                        bug!("union cannot be packed and aligned");
+                        self.tcx.sess.delay_span_bug(
+                            tcx.def_span(def.did),
+                            "union cannot be packed and aligned",
+                        );
+                        return Err(LayoutError::Unknown(ty));
                     }
 
                     let mut align =
@@ -1251,13 +1273,13 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
                 } else {
                     // Try to use a ScalarPair for all tagged enums.
                     let mut common_prim = None;
-                    for (field_layouts, layout_variant) in variants.iter().zip(&layout_variants) {
+                    for (field_layouts, layout_variant) in iter::zip(&variants, &layout_variants) {
                         let offsets = match layout_variant.fields {
                             FieldsShape::Arbitrary { ref offsets, .. } => offsets,
                             _ => bug!(),
                         };
                         let mut fields =
-                            field_layouts.iter().zip(offsets).filter(|p| !p.0.is_zst());
+                            iter::zip(field_layouts, offsets).filter(|p| !p.0.is_zst());
                         let (field, offset) = match (fields.next(), fields.next()) {
                             (None, None) => continue,
                             (Some(pair), None) => pair,
@@ -1626,7 +1648,7 @@ impl<'tcx> LayoutCx<'tcx, TyCtxt<'tcx>> {
                 const INVALID_FIELD_IDX: u32 = !0;
                 let mut combined_inverse_memory_index =
                     vec![INVALID_FIELD_IDX; promoted_memory_index.len() + memory_index.len()];
-                let mut offsets_and_memory_index = offsets.into_iter().zip(memory_index);
+                let mut offsets_and_memory_index = iter::zip(offsets, memory_index);
                 let combined_offsets = variant_fields
                     .iter()
                     .enumerate()
@@ -2318,31 +2340,30 @@ where
             ty::Ref(_, ty, mt) if offset.bytes() == 0 => {
                 let address_space = addr_space_of_ty(ty);
                 let tcx = cx.tcx();
-                let is_freeze = ty.is_freeze(tcx.at(DUMMY_SP), cx.param_env());
-                let kind = match mt {
-                    hir::Mutability::Not => {
-                        if is_freeze {
-                            PointerKind::Frozen
-                        } else {
-                            PointerKind::Shared
+                let kind = if tcx.sess.opts.optimize == OptLevel::No {
+                    // Use conservative pointer kind if not optimizing. This saves us the
+                    // Freeze/Unpin queries, and can save time in the codegen backend (noalias
+                    // attributes in LLVM have compile-time cost even in unoptimized builds).
+                    PointerKind::Shared
+                } else {
+                    match mt {
+                        hir::Mutability::Not => {
+                            if ty.is_freeze(tcx.at(DUMMY_SP), cx.param_env()) {
+                                PointerKind::Frozen
+                            } else {
+                                PointerKind::Shared
+                            }
                         }
-                    }
-                    hir::Mutability::Mut => {
-                        // Previously we would only emit noalias annotations for LLVM >= 6 or in
-                        // panic=abort mode. That was deemed right, as prior versions had many bugs
-                        // in conjunction with unwinding, but later versions didn’t seem to have
-                        // said issues. See issue #31681.
-                        //
-                        // Alas, later on we encountered a case where noalias would generate wrong
-                        // code altogether even with recent versions of LLVM in *safe* code with no
-                        // unwinding involved. See #54462.
-                        //
-                        // For now, do not enable mutable_noalias by default at all, while the
-                        // issue is being figured out.
-                        if tcx.sess.opts.debugging_opts.mutable_noalias {
-                            PointerKind::UniqueBorrowed
-                        } else {
-                            PointerKind::Shared
+                        hir::Mutability::Mut => {
+                            // References to self-referential structures should not be considered
+                            // noalias, as another pointer to the structure can be obtained, that
+                            // is not based-on the original reference. We consider all !Unpin
+                            // types to be potentially self-referential here.
+                            if ty.is_unpin(tcx.at(DUMMY_SP), cx.param_env()) {
+                                PointerKind::UniqueBorrowed
+                            } else {
+                                PointerKind::Shared
+                            }
                         }
                     }
                 };
@@ -2462,9 +2483,10 @@ impl<'tcx> ty::Instance<'tcx> {
                 // `src/test/ui/polymorphization/normalized_sig_types.rs`), and codegen not keeping
                 // track of a polymorphization `ParamEnv` to allow normalizing later.
                 let mut sig = match *ty.kind() {
-                    ty::FnDef(def_id, substs) => tcx
+                    ty::FnDef(def_id, substs) if tcx.sess.opts.debugging_opts.polymorphize => tcx
                         .normalize_erasing_regions(tcx.param_env(def_id), tcx.fn_sig(def_id))
                         .subst(tcx, substs),
+                    ty::FnDef(def_id, substs) => tcx.fn_sig(def_id).subst(tcx, substs),
                     _ => unreachable!(),
                 };
 
@@ -2482,21 +2504,42 @@ impl<'tcx> ty::Instance<'tcx> {
             ty::Closure(def_id, substs) => {
                 let sig = substs.as_closure().sig();
 
-                let env_ty = tcx.closure_env_ty(def_id, substs).unwrap();
-                sig.map_bound(|sig| {
+                let bound_vars = tcx.mk_bound_variable_kinds(
+                    sig.bound_vars()
+                        .iter()
+                        .chain(iter::once(ty::BoundVariableKind::Region(ty::BrEnv))),
+                );
+                let br = ty::BoundRegion {
+                    var: ty::BoundVar::from_usize(bound_vars.len() - 1),
+                    kind: ty::BoundRegionKind::BrEnv,
+                };
+                let env_region = ty::ReLateBound(ty::INNERMOST, br);
+                let env_ty = tcx.closure_env_ty(def_id, substs, env_region).unwrap();
+
+                let sig = sig.skip_binder();
+                ty::Binder::bind_with_vars(
                     tcx.mk_fn_sig(
-                        iter::once(env_ty.skip_binder()).chain(sig.inputs().iter().cloned()),
+                        iter::once(env_ty).chain(sig.inputs().iter().cloned()),
                         sig.output(),
                         sig.c_variadic,
                         sig.unsafety,
                         sig.abi,
-                    )
-                })
+                    ),
+                    bound_vars,
+                )
             }
             ty::Generator(_, substs, _) => {
                 let sig = substs.as_generator().poly_sig();
 
-                let br = ty::BoundRegion { kind: ty::BrEnv };
+                let bound_vars = tcx.mk_bound_variable_kinds(
+                    sig.bound_vars()
+                        .iter()
+                        .chain(iter::once(ty::BoundVariableKind::Region(ty::BrEnv))),
+                );
+                let br = ty::BoundRegion {
+                    var: ty::BoundVar::from_usize(bound_vars.len() - 1),
+                    kind: ty::BoundRegionKind::BrEnv,
+                };
                 let env_region = ty::ReLateBound(ty::INNERMOST, br);
                 let env_ty = tcx.mk_mut_ref(tcx.mk_region(env_region), ty);
 
@@ -2505,21 +2548,21 @@ impl<'tcx> ty::Instance<'tcx> {
                 let pin_substs = tcx.intern_substs(&[env_ty.into()]);
                 let env_ty = tcx.mk_adt(pin_adt_ref, pin_substs);
 
-                sig.map_bound(|sig| {
-                    let state_did = tcx.require_lang_item(LangItem::GeneratorState, None);
-                    let state_adt_ref = tcx.adt_def(state_did);
-                    let state_substs =
-                        tcx.intern_substs(&[sig.yield_ty.into(), sig.return_ty.into()]);
-                    let ret_ty = tcx.mk_adt(state_adt_ref, state_substs);
-
+                let sig = sig.skip_binder();
+                let state_did = tcx.require_lang_item(LangItem::GeneratorState, None);
+                let state_adt_ref = tcx.adt_def(state_did);
+                let state_substs = tcx.intern_substs(&[sig.yield_ty.into(), sig.return_ty.into()]);
+                let ret_ty = tcx.mk_adt(state_adt_ref, state_substs);
+                ty::Binder::bind_with_vars(
                     tcx.mk_fn_sig(
                         [env_ty, sig.resume_ty].iter(),
                         &ret_ty,
                         false,
                         hir::Unsafety::Normal,
                         rustc_target::spec::abi::Abi::Rust,
-                    )
-                })
+                    ),
+                    bound_vars,
+                )
             }
             _ => bug!("unexpected type {:?} in Instance::fn_sig", ty),
         }
@@ -2558,7 +2601,7 @@ where
     fn adjust_for_abi(&mut self, cx: &C, abi: SpecAbi);
 }
 
-fn fn_can_unwind(
+pub fn fn_can_unwind(
     panic_strategy: PanicStrategy,
     codegen_fn_attr_flags: CodegenFnAttrFlags,
     call_conv: Conv,
@@ -2609,6 +2652,7 @@ fn fn_can_unwind(
                 | AvrInterrupt
                 | AvrNonBlockingInterrupt
                 | CCmseNonSecureCall
+                | Wasm
                 | RustIntrinsic
                 | PlatformIntrinsic
                 | Unadjusted => false,
@@ -2617,6 +2661,43 @@ fn fn_can_unwind(
             }
         }
     }
+}
+
+pub fn conv_from_spec_abi(tcx: TyCtxt<'_>, abi: SpecAbi) -> Conv {
+    use rustc_target::spec::abi::Abi::*;
+    match tcx.sess.target.adjust_abi(abi) {
+        RustIntrinsic | PlatformIntrinsic | Rust | RustCall => Conv::Rust,
+
+        // It's the ABI's job to select this, not ours.
+        System { .. } => bug!("system abi should be selected elsewhere"),
+        EfiApi => bug!("eficall abi should be selected elsewhere"),
+
+        Stdcall { .. } => Conv::X86Stdcall,
+        Fastcall => Conv::X86Fastcall,
+        Vectorcall => Conv::X86VectorCall,
+        Thiscall { .. } => Conv::X86ThisCall,
+        C { .. } => Conv::C,
+        Unadjusted => Conv::C,
+        Win64 => Conv::X86_64Win64,
+        SysV64 => Conv::X86_64SysV,
+        Aapcs => Conv::ArmAapcs,
+        CCmseNonSecureCall => Conv::CCmseNonSecureCall,
+        PtxKernel => Conv::PtxKernel,
+        Msp430Interrupt => Conv::Msp430Intr,
+        X86Interrupt => Conv::X86Intr,
+        AmdGpuKernel => Conv::AmdGpuKernel,
+        AvrInterrupt => Conv::AvrInterrupt,
+        AvrNonBlockingInterrupt => Conv::AvrNonBlockingInterrupt,
+        Wasm => Conv::C,
+
+        // These API constants ought to be more specific...
+        Cdecl => Conv::C,
+    }
+}
+
+pub fn fn_ptr_codegen_fn_attr_flags() -> CodegenFnAttrFlags {
+    // Assume that fn pointers may always unwind
+    CodegenFnAttrFlags::UNWIND
 }
 
 impl<'tcx, C> FnAbiExt<'tcx, C> for call::FnAbi<'tcx, Ty<'tcx>>
@@ -2628,10 +2709,7 @@ where
         + HasParamEnv<'tcx>,
 {
     fn of_fn_ptr(cx: &C, sig: ty::PolyFnSig<'tcx>, extra_args: &[Ty<'tcx>]) -> Self {
-        // Assume that fn pointers may always unwind
-        let codegen_fn_attr_flags = CodegenFnAttrFlags::UNWIND;
-
-        call::FnAbi::new_internal(cx, sig, extra_args, None, codegen_fn_attr_flags, false)
+        call::FnAbi::new_internal(cx, sig, extra_args, None, fn_ptr_codegen_fn_attr_flags(), false)
     }
 
     fn of_instance(cx: &C, instance: ty::Instance<'tcx>, extra_args: &[Ty<'tcx>]) -> Self {
@@ -2667,34 +2745,7 @@ where
 
         let sig = cx.tcx().normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), sig);
 
-        use rustc_target::spec::abi::Abi::*;
-        let conv = match cx.tcx().sess.target.adjust_abi(sig.abi) {
-            RustIntrinsic | PlatformIntrinsic | Rust | RustCall => Conv::Rust,
-
-            // It's the ABI's job to select this, not ours.
-            System { .. } => bug!("system abi should be selected elsewhere"),
-            EfiApi => bug!("eficall abi should be selected elsewhere"),
-
-            Stdcall { .. } => Conv::X86Stdcall,
-            Fastcall => Conv::X86Fastcall,
-            Vectorcall => Conv::X86VectorCall,
-            Thiscall { .. } => Conv::X86ThisCall,
-            C { .. } => Conv::C,
-            Unadjusted => Conv::C,
-            Win64 => Conv::X86_64Win64,
-            SysV64 => Conv::X86_64SysV,
-            Aapcs => Conv::ArmAapcs,
-            CCmseNonSecureCall => Conv::CCmseNonSecureCall,
-            PtxKernel => Conv::PtxKernel,
-            Msp430Interrupt => Conv::Msp430Intr,
-            X86Interrupt => Conv::X86Intr,
-            AmdGpuKernel => Conv::AmdGpuKernel,
-            AvrInterrupt => Conv::AvrInterrupt,
-            AvrNonBlockingInterrupt => Conv::AvrNonBlockingInterrupt,
-
-            // These API constants ought to be more specific...
-            Cdecl => Conv::C,
-        };
+        let conv = conv_from_spec_abi(cx.tcx(), sig.abi);
 
         let mut inputs = sig.inputs();
         let extra_args = if sig.abi == RustCall {
@@ -2730,6 +2781,7 @@ where
             target.os == "linux" && target.arch == "sparc64" && target_env_gnu_like;
         let linux_powerpc_gnu_like =
             target.os == "linux" && target.arch == "powerpc" && target_env_gnu_like;
+        use SpecAbi::*;
         let rust_abi = matches!(sig.abi, RustIntrinsic | PlatformIntrinsic | Rust | RustCall);
 
         // Handle safe Rust thin and fat pointers.
@@ -2775,10 +2827,14 @@ where
                     // and can be marked as both `readonly` and `noalias`, as
                     // LLVM's definition of `noalias` is based solely on memory
                     // dependencies rather than pointer equality
+                    //
+                    // Due to miscompiles in LLVM < 12, we apply a separate NoAliasMutRef attribute
+                    // for UniqueBorrowed arguments, so that the codegen backend can decide
+                    // whether or not to actually emit the attribute.
                     let no_alias = match kind {
-                        PointerKind::Shared => false,
+                        PointerKind::Shared | PointerKind::UniqueBorrowed => false,
                         PointerKind::UniqueOwned => true,
-                        PointerKind::Frozen | PointerKind::UniqueBorrowed => !is_return,
+                        PointerKind::Frozen => !is_return,
                     };
                     if no_alias {
                         attrs.set(ArgAttribute::NoAlias);
@@ -2786,6 +2842,10 @@ where
 
                     if kind == PointerKind::Frozen && !is_return {
                         attrs.set(ArgAttribute::ReadOnly);
+                    }
+
+                    if kind == PointerKind::UniqueBorrowed && !is_return {
+                        attrs.set(ArgAttribute::NoAliasMutRef);
                     }
                 }
             }

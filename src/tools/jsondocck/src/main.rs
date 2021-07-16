@@ -1,5 +1,5 @@
 use jsonpath_lib::select;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -94,19 +94,19 @@ impl fmt::Display for CommandKind {
     }
 }
 
-lazy_static! {
-    static ref LINE_PATTERN: Regex = RegexBuilder::new(
+static LINE_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    RegexBuilder::new(
         r#"
         \s(?P<invalid>!?)@(?P<negated>!?)
         (?P<cmd>[A-Za-z]+(?:-[A-Za-z]+)*)
         (?P<args>.*)$
-    "#
+    "#,
     )
     .ignore_whitespace(true)
     .unicode(true)
     .build()
-    .unwrap();
-}
+    .unwrap()
+});
 
 fn print_err(msg: &str, lineno: usize) {
     eprintln!("Invalid command: {} on line {}", msg, lineno)
@@ -239,7 +239,20 @@ fn check_command(command: Command, cache: &mut Cache) -> Result<(), CkError> {
             let val = cache.get_value(&command.args[0])?;
             let results = select(&val, &command.args[1]).unwrap();
             let pat = string_to_value(&command.args[2], cache);
-            results.len() == 1 && results[0] == pat.as_ref()
+            let is = results.len() == 1 && results[0] == pat.as_ref();
+            if !command.negated && !is {
+                return Err(CkError::FailedCheck(
+                    format!(
+                        "{} matched to {:?}, but expected {:?}",
+                        &command.args[1],
+                        results,
+                        pat.as_ref()
+                    ),
+                    command,
+                ));
+            } else {
+                is
+            }
         }
         CommandKind::Set => {
             // @set <name> = <path> <jsonpath>
@@ -299,7 +312,10 @@ fn check_command(command: Command, cache: &mut Cache) -> Result<(), CkError> {
 
 fn string_to_value<'a>(s: &str, cache: &'a Cache) -> Cow<'a, Value> {
     if s.starts_with("$") {
-        Cow::Borrowed(&cache.variables[&s[1..]])
+        Cow::Borrowed(&cache.variables.get(&s[1..]).unwrap_or_else(|| {
+            // FIXME(adotinthevoid): Show line number
+            panic!("No variable: `{}`. Current state: `{:?}`", &s[1..], cache.variables)
+        }))
     } else {
         Cow::Owned(serde_json::from_str(s).unwrap())
     }

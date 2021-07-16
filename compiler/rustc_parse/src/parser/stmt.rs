@@ -1,7 +1,7 @@
 use super::attr::DEFAULT_INNER_ATTR_FORBIDDEN;
 use super::diagnostics::{AttemptLocalParseRecovery, Error};
 use super::expr::LhsExpr;
-use super::pat::{GateOr, RecoverComma};
+use super::pat::RecoverComma;
 use super::path::PathStyle;
 use super::TrailingToken;
 use super::{AttrWrapper, BlockMode, ForceCollect, Parser, Restrictions, SemiColonMode};
@@ -48,45 +48,36 @@ impl<'a> Parser<'a> {
         if let token::Interpolated(nt) = &self.token.kind {
             if let token::NtStmt(stmt) = &**nt {
                 let mut stmt = stmt.clone();
-                return self.collect_tokens_trailing_token(
-                    attrs,
-                    force_collect,
-                    |this, mut attrs| {
-                        stmt.visit_attrs(|stmt_attrs| {
-                            mem::swap(stmt_attrs, &mut attrs);
-                            stmt_attrs.extend(attrs);
-                        });
-                        // Make sure we capture the token::Interpolated
-                        this.bump();
-                        Ok((Some(stmt), TrailingToken::None))
-                    },
-                );
+                self.bump();
+                stmt.visit_attrs(|stmt_attrs| {
+                    attrs.prepend_to_nt_inner(stmt_attrs);
+                });
+                return Ok(Some(stmt));
             }
         }
 
         Ok(Some(if self.token.is_keyword(kw::Let) {
             self.parse_local_mk(lo, attrs, capture_semi, force_collect)?
         } else if self.is_kw_followed_by_ident(kw::Mut) {
-            self.recover_stmt_local(
-                lo,
-                attrs.take_for_recovery().into(),
-                "missing keyword",
-                "let mut",
-            )?
+            self.recover_stmt_local(lo, attrs, "missing keyword", "let mut")?
         } else if self.is_kw_followed_by_ident(kw::Auto) {
             self.bump(); // `auto`
             let msg = "write `let` instead of `auto` to introduce a new variable";
-            self.recover_stmt_local(lo, attrs.take_for_recovery().into(), msg, "let")?
+            self.recover_stmt_local(lo, attrs, msg, "let")?
         } else if self.is_kw_followed_by_ident(sym::var) {
             self.bump(); // `var`
             let msg = "write `let` instead of `var` to introduce a new variable";
-            self.recover_stmt_local(lo, attrs.take_for_recovery().into(), msg, "let")?
+            self.recover_stmt_local(lo, attrs, msg, "let")?
         } else if self.check_path() && !self.token.is_qpath_start() && !self.is_path_start_item() {
             // We have avoided contextual keywords like `union`, items with `crate` visibility,
             // or `auto trait` items. We aim to parse an arbitrary path `a::b` but not something
             // that starts like a path (1 token), but it fact not a path.
             // Also, we avoid stealing syntax from `parse_item_`.
-            self.parse_stmt_path_start(lo, attrs, force_collect)?
+            if force_collect == ForceCollect::Yes {
+                self.collect_tokens_no_attrs(|this| this.parse_stmt_path_start(lo, attrs))
+            } else {
+                self.parse_stmt_path_start(lo, attrs)
+            }?
         } else if let Some(item) =
             self.parse_item_common(attrs.clone(), false, true, |_| true, force_collect)?
         {
@@ -98,7 +89,13 @@ impl<'a> Parser<'a> {
             self.mk_stmt(lo, StmtKind::Empty)
         } else if self.token != token::CloseDelim(token::Brace) {
             // Remainder are line-expr stmts.
-            let e = self.parse_expr_res(Restrictions::STMT_EXPR, Some(attrs))?;
+            let e = if force_collect == ForceCollect::Yes {
+                self.collect_tokens_no_attrs(|this| {
+                    this.parse_expr_res(Restrictions::STMT_EXPR, Some(attrs))
+                })
+            } else {
+                self.parse_expr_res(Restrictions::STMT_EXPR, Some(attrs))
+            }?;
             self.mk_stmt(lo.to(e.span), StmtKind::Expr(e))
         } else {
             self.error_outer_attrs(&attrs.take_for_recovery());
@@ -106,13 +103,8 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_stmt_path_start(
-        &mut self,
-        lo: Span,
-        attrs: AttrWrapper,
-        force_collect: ForceCollect,
-    ) -> PResult<'a, Stmt> {
-        self.collect_tokens_trailing_token(attrs, force_collect, |this, attrs| {
+    fn parse_stmt_path_start(&mut self, lo: Span, attrs: AttrWrapper) -> PResult<'a, Stmt> {
+        let stmt = self.collect_tokens_trailing_token(attrs, ForceCollect::No, |this, attrs| {
             let path = this.parse_path(PathStyle::Expr)?;
 
             if this.eat(&token::Not) {
@@ -125,21 +117,29 @@ impl<'a> Parser<'a> {
             }
 
             let expr = if this.eat(&token::OpenDelim(token::Brace)) {
-                this.parse_struct_expr(path, AttrVec::new(), true)?
+                this.parse_struct_expr(None, path, AttrVec::new(), true)?
             } else {
                 let hi = this.prev_token.span;
                 this.mk_expr(lo.to(hi), ExprKind::Path(None, path), AttrVec::new())
             };
 
             let expr = this.with_res(Restrictions::STMT_EXPR, |this| {
-                let expr = this.parse_dot_or_call_expr_with(expr, lo, attrs)?;
+                this.parse_dot_or_call_expr_with(expr, lo, attrs)
+            })?;
+            // `DUMMY_SP` will get overwritten later in this function
+            Ok((this.mk_stmt(rustc_span::DUMMY_SP, StmtKind::Expr(expr)), TrailingToken::None))
+        })?;
+
+        if let StmtKind::Expr(expr) = stmt.kind {
+            // Perform this outside of the `collect_tokens_trailing_token` closure,
+            // since our outer attributes do not apply to this part of the expression
+            let expr = self.with_res(Restrictions::STMT_EXPR, |this| {
                 this.parse_assoc_expr_with(0, LhsExpr::AlreadyParsed(expr))
             })?;
-            Ok((
-                this.mk_stmt(lo.to(this.prev_token.span), StmtKind::Expr(expr)),
-                TrailingToken::None,
-            ))
-        })
+            Ok(self.mk_stmt(lo.to(self.prev_token.span), StmtKind::Expr(expr)))
+        } else {
+            Ok(stmt)
+        }
     }
 
     /// Parses a statement macro `mac!(args)` provided a `path` representing `mac`.
@@ -173,7 +173,7 @@ impl<'a> Parser<'a> {
     fn error_outer_attrs(&self, attrs: &[Attribute]) {
         if let [.., last] = attrs {
             if last.is_doc_comment() {
-                self.span_fatal_err(last.span, Error::UselessDocComment).emit();
+                self.span_err(last.span, Error::UselessDocComment).emit();
             } else if attrs.iter().any(|a| a.style == AttrStyle::Outer) {
                 self.struct_span_err(last.span, "expected statement after outer attribute").emit();
             }
@@ -183,7 +183,7 @@ impl<'a> Parser<'a> {
     fn recover_stmt_local(
         &mut self,
         lo: Span,
-        attrs: AttrVec,
+        attrs: AttrWrapper,
         msg: &str,
         sugg: &str,
     ) -> PResult<'a, Stmt> {
@@ -213,16 +213,21 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn recover_local_after_let(&mut self, lo: Span, attrs: AttrVec) -> PResult<'a, Stmt> {
-        let local = self.parse_local(attrs)?;
-        Ok(self.mk_stmt(lo.to(self.prev_token.span), StmtKind::Local(local)))
+    fn recover_local_after_let(&mut self, lo: Span, attrs: AttrWrapper) -> PResult<'a, Stmt> {
+        self.collect_tokens_trailing_token(attrs, ForceCollect::No, |this, attrs| {
+            let local = this.parse_local(attrs.into())?;
+            // FIXME - maybe capture semicolon in recovery?
+            Ok((
+                this.mk_stmt(lo.to(this.prev_token.span), StmtKind::Local(local)),
+                TrailingToken::None,
+            ))
+        })
     }
 
     /// Parses a local variable declaration.
     fn parse_local(&mut self, attrs: AttrVec) -> PResult<'a, P<Local>> {
         let lo = self.prev_token.span;
-        let (pat, colon) =
-            self.parse_pat_before_ty(None, GateOr::Yes, RecoverComma::Yes, "`let` bindings")?;
+        let (pat, colon) = self.parse_pat_before_ty(None, RecoverComma::Yes, "`let` bindings")?;
 
         let (err, ty) = if colon {
             // Save the state of the parser before parsing type normally, in case there is a `:`

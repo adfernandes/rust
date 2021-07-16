@@ -71,7 +71,6 @@ use crate::sys_common::{AsInner, FromInner, IntoInner};
 /// [`&str`]: str
 /// [`CStr`]: crate::ffi::CStr
 /// [conversions]: super#conversions
-#[derive(Clone)]
 #[cfg_attr(not(test), rustc_diagnostic_item = "OsString")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct OsString {
@@ -361,7 +360,7 @@ impl OsString {
 impl From<String> for OsString {
     /// Converts a [`String`] into a [`OsString`].
     ///
-    /// The conversion copies the data, and includes an allocation on the heap.
+    /// This conversion does not allocate or copy memory.
     #[inline]
     fn from(s: String) -> OsString {
         OsString { inner: Buf::from_string(s) }
@@ -417,6 +416,19 @@ impl Default for OsString {
     #[inline]
     fn default() -> OsString {
         OsString::new()
+    }
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl Clone for OsString {
+    #[inline]
+    fn clone(&self) -> Self {
+        OsString { inner: self.inner.clone() }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.inner.clone_from(&source.inner)
     }
 }
 
@@ -589,7 +601,7 @@ impl OsStr {
     /// // sequences simply through collecting user command line arguments, for
     /// // example.
     ///
-    /// #[cfg(any(unix, target_os = "redox"))] {
+    /// #[cfg(unix)] {
     ///     use std::ffi::OsStr;
     ///     use std::os::unix::ffi::OsStrExt;
     ///
@@ -682,7 +694,6 @@ impl OsStr {
     /// let os_str = OsStr::new("foo");
     /// assert_eq!(os_str.len(), 3);
     /// ```
-    #[doc(alias = "length")]
     #[stable(feature = "osstring_simple_functions", since = "1.9.0")]
     #[inline]
     pub fn len(&self) -> usize {
@@ -716,7 +727,6 @@ impl OsStr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(osstring_ascii)]
     /// use std::ffi::OsString;
     ///
     /// let mut s = OsString::from("GRÜßE, JÜRGEN ❤");
@@ -725,7 +735,7 @@ impl OsStr {
     ///
     /// assert_eq!("grÜße, jÜrgen ❤", s);
     /// ```
-    #[unstable(feature = "osstring_ascii", issue = "70516")]
+    #[stable(feature = "osstring_ascii", since = "1.53.0")]
     #[inline]
     pub fn make_ascii_lowercase(&mut self) {
         self.inner.make_ascii_lowercase()
@@ -742,7 +752,6 @@ impl OsStr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(osstring_ascii)]
     /// use std::ffi::OsString;
     ///
     /// let mut s = OsString::from("Grüße, Jürgen ❤");
@@ -751,7 +760,7 @@ impl OsStr {
     ///
     /// assert_eq!("GRüßE, JüRGEN ❤", s);
     /// ```
-    #[unstable(feature = "osstring_ascii", issue = "70516")]
+    #[stable(feature = "osstring_ascii", since = "1.53.0")]
     #[inline]
     pub fn make_ascii_uppercase(&mut self) {
         self.inner.make_ascii_uppercase()
@@ -768,13 +777,12 @@ impl OsStr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(osstring_ascii)]
     /// use std::ffi::OsString;
     /// let s = OsString::from("Grüße, Jürgen ❤");
     ///
     /// assert_eq!("grüße, jürgen ❤", s.to_ascii_lowercase());
     /// ```
-    #[unstable(feature = "osstring_ascii", issue = "70516")]
+    #[stable(feature = "osstring_ascii", since = "1.53.0")]
     pub fn to_ascii_lowercase(&self) -> OsString {
         OsString::from_inner(self.inner.to_ascii_lowercase())
     }
@@ -790,13 +798,12 @@ impl OsStr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(osstring_ascii)]
     /// use std::ffi::OsString;
     /// let s = OsString::from("Grüße, Jürgen ❤");
     ///
     /// assert_eq!("GRüßE, JüRGEN ❤", s.to_ascii_uppercase());
     /// ```
-    #[unstable(feature = "osstring_ascii", issue = "70516")]
+    #[stable(feature = "osstring_ascii", since = "1.53.0")]
     pub fn to_ascii_uppercase(&self) -> OsString {
         OsString::from_inner(self.inner.to_ascii_uppercase())
     }
@@ -806,7 +813,6 @@ impl OsStr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(osstring_ascii)]
     /// use std::ffi::OsString;
     ///
     /// let ascii = OsString::from("hello!\n");
@@ -815,7 +821,7 @@ impl OsStr {
     /// assert!(ascii.is_ascii());
     /// assert!(!non_ascii.is_ascii());
     /// ```
-    #[unstable(feature = "osstring_ascii", issue = "70516")]
+    #[stable(feature = "osstring_ascii", since = "1.53.0")]
     #[inline]
     pub fn is_ascii(&self) -> bool {
         self.inner.is_ascii()
@@ -829,14 +835,13 @@ impl OsStr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(osstring_ascii)]
     /// use std::ffi::OsString;
     ///
     /// assert!(OsString::from("Ferris").eq_ignore_ascii_case("FERRIS"));
     /// assert!(OsString::from("Ferrös").eq_ignore_ascii_case("FERRöS"));
     /// assert!(!OsString::from("Ferrös").eq_ignore_ascii_case("FERRÖS"));
     /// ```
-    #[unstable(feature = "osstring_ascii", issue = "70516")]
+    #[stable(feature = "osstring_ascii", since = "1.53.0")]
     pub fn eq_ignore_ascii_case<S: AsRef<OsStr>>(&self, other: S) -> bool {
         self.inner.eq_ignore_ascii_case(&other.as_ref().inner)
     }
@@ -864,7 +869,7 @@ impl From<Cow<'_, OsStr>> for Box<OsStr> {
 
 #[stable(feature = "os_string_from_box", since = "1.18.0")]
 impl From<Box<OsStr>> for OsString {
-    /// Converts a [`Box`]`<`[`OsStr`]`>` into a `OsString` without copying or
+    /// Converts a [`Box`]`<`[`OsStr`]`>` into an [`OsString`] without copying or
     /// allocating.
     #[inline]
     fn from(boxed: Box<OsStr>) -> OsString {

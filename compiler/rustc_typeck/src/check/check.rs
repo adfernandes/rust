@@ -6,7 +6,7 @@ use super::*;
 use rustc_attr as attr;
 use rustc_errors::{Applicability, ErrorReported};
 use rustc_hir as hir;
-use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{def::Res, ItemKind, Node, PathSegment};
@@ -15,17 +15,18 @@ use rustc_infer::infer::{RegionVariableOrigin, TyCtxtInferExt};
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::layout::MAX_SIMD_LANES;
 use rustc_middle::ty::subst::GenericArgKind;
-use rustc_middle::ty::util::{Discr, IntTypeExt, Representability};
-use rustc_middle::ty::{self, ParamEnv, RegionKind, ToPredicate, Ty, TyCtxt};
-use rustc_session::config::EntryFnType;
-use rustc_session::lint::builtin::UNINHABITED_STATIC;
+use rustc_middle::ty::util::{Discr, IntTypeExt};
+use rustc_middle::ty::{self, OpaqueTypeKey, ParamEnv, RegionKind, Ty, TyCtxt};
+use rustc_session::lint::builtin::{UNINHABITED_STATIC, UNSUPPORTED_CALLING_CONVENTIONS};
 use rustc_span::symbol::sym;
 use rustc_span::{self, MultiSpan, Span};
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::opaque_types::InferCtxtExt as _;
+use rustc_trait_selection::traits;
 use rustc_trait_selection::traits::error_reporting::InferCtxtExt as _;
-use rustc_trait_selection::traits::{self, ObligationCauseCode};
+use rustc_ty_utils::representability::{self, Representability};
 
+use std::iter;
 use std::ops::ControlFlow;
 
 pub fn check_wf_new(tcx: TyCtxt<'_>) {
@@ -33,16 +34,22 @@ pub fn check_wf_new(tcx: TyCtxt<'_>) {
     tcx.hir().krate().par_visit_all_item_likes(&visit);
 }
 
-pub(super) fn check_abi(tcx: TyCtxt<'_>, span: Span, abi: Abi) {
-    if !tcx.sess.target.is_abi_supported(abi) {
-        struct_span_err!(
+pub(super) fn check_abi(tcx: TyCtxt<'_>, hir_id: hir::HirId, span: Span, abi: Abi) {
+    match tcx.sess.target.is_abi_supported(abi) {
+        Some(true) => (),
+        Some(false) => struct_span_err!(
             tcx.sess,
             span,
             E0570,
-            "The ABI `{}` is not supported for the current target",
+            "`{}` is not a supported ABI for the current target",
             abi
         )
-        .emit()
+        .emit(),
+        None => {
+            tcx.struct_span_lint_hir(UNSUPPORTED_CALLING_CONVENTIONS, hir_id, span, |lint| {
+                lint.build("use of calling convention not supported on this target").emit()
+            });
+        }
     }
 
     // This ABI is only allowed on function pointers
@@ -87,8 +94,69 @@ pub(super) fn check_fn<'a, 'tcx>(
 
     let declared_ret_ty = fn_sig.output();
 
-    let revealed_ret_ty =
-        fcx.instantiate_opaque_types_from_value(fn_id, declared_ret_ty, decl.output.span());
+    let feature = match tcx.hir().get(fn_id) {
+        // TAIT usage in function return position.
+        // Example:
+        //
+        // ```rust
+        // type Foo = impl Debug;
+        // fn bar() -> Foo { 42 }
+        // ```
+        Node::Item(hir::Item { kind: ItemKind::Fn(..), .. }) |
+        // TAIT usage in associated function return position.
+        //
+        // Example with a free type alias:
+        //
+        // ```rust
+        // type Foo = impl Debug;
+        // impl SomeTrait for SomeType {
+        //     fn bar() -> Foo { 42 }
+        // }
+        // ```
+        //
+        // Example with an associated TAIT:
+        //
+        // ```rust
+        // impl SomeTrait for SomeType {
+        //     type Foo = impl Debug;
+        //     fn bar() -> Self::Foo { 42 }
+        // }
+        // ```
+        Node::ImplItem(hir::ImplItem {
+            kind: hir::ImplItemKind::Fn(..), ..
+        }) => None,
+        // Forbid TAIT in trait declarations for now.
+        // Examples:
+        //
+        // ```rust
+        // type Foo = impl Debug;
+        // trait Bar {
+        //     fn bar() -> Foo;
+        // }
+        // trait Bop {
+        //     type Bop: PartialEq<Foo>;
+        // }
+        // ```
+        Node::TraitItem(hir::TraitItem {
+            kind: hir::TraitItemKind::Fn(..),
+            ..
+        }) |
+        // Forbid TAIT in closure return position for now.
+        // Example:
+        //
+        // ```rust
+        // type Foo = impl Debug;
+        // let x = |y| -> Foo { 42 + y };
+        // ```
+        Node::Expr(hir::Expr { kind: hir::ExprKind::Closure(..), .. }) => Some(sym::type_alias_impl_trait),
+        node => bug!("Item being checked wasn't a function/closure: {:?}", node),
+    };
+    let revealed_ret_ty = fcx.instantiate_opaque_types_from_value(
+        fn_id,
+        declared_ret_ty,
+        decl.output.span(),
+        feature,
+    );
     debug!("check_fn: declared_ret_ty: {}, revealed_ret_ty: {}", declared_ret_ty, revealed_ret_ty);
     fcx.ret_coercion = Some(RefCell::new(CoerceMany::new(revealed_ret_ty)));
     fcx.ret_type_span = Some(decl.output.span());
@@ -262,29 +330,6 @@ pub(super) fn check_fn<'a, 'tcx>(
         });
     }
     fcx.demand_suptype(span, revealed_ret_ty, actual_return_ty);
-
-    // Check that the main return type implements the termination trait.
-    if let Some(term_id) = tcx.lang_items().termination() {
-        if let Some((def_id, EntryFnType::Main)) = tcx.entry_fn(LOCAL_CRATE) {
-            let main_id = hir.local_def_id_to_hir_id(def_id);
-            if main_id == fn_id {
-                let substs = tcx.mk_substs_trait(declared_ret_ty, &[]);
-                let trait_ref = ty::TraitRef::new(term_id, substs);
-                let return_ty_span = decl.output.span();
-                let cause = traits::ObligationCause::new(
-                    return_ty_span,
-                    fn_id,
-                    ObligationCauseCode::MainFunctionType,
-                );
-
-                inherited.register_predicate(traits::Obligation::new(
-                    cause,
-                    param_env,
-                    trait_ref.without_const().to_predicate(tcx),
-                ));
-            }
-        }
-    }
 
     // Check that a function marked as `#[panic_handler]` has signature `fn(&PanicInfo) -> !`
     if let Some(panic_impl_did) = tcx.lang_items().panic_impl() {
@@ -659,7 +704,8 @@ fn check_opaque_meets_bounds<'tcx>(
         // Checked when type checking the function containing them.
         hir::OpaqueTyOrigin::FnReturn | hir::OpaqueTyOrigin::AsyncFn => return,
         // Can have different predicates to their defining use
-        hir::OpaqueTyOrigin::Binding | hir::OpaqueTyOrigin::Misc => {}
+        hir::OpaqueTyOrigin::Binding | hir::OpaqueTyOrigin::Misc | hir::OpaqueTyOrigin::TyAlias => {
+        }
     }
 
     let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
@@ -676,10 +722,10 @@ fn check_opaque_meets_bounds<'tcx>(
             infcx.instantiate_opaque_types(def_id, hir_id, param_env, opaque_ty, span),
         );
 
-        for (def_id, opaque_defn) in opaque_type_map {
+        for (OpaqueTypeKey { def_id, substs }, opaque_defn) in opaque_type_map {
             match infcx
                 .at(&misc_cause, param_env)
-                .eq(opaque_defn.concrete_ty, tcx.type_of(def_id).subst(tcx, opaque_defn.substs))
+                .eq(opaque_defn.concrete_ty, tcx.type_of(def_id).subst(tcx, substs))
             {
                 Ok(infer_ok) => inh.register_infer_ok_obligations(infer_ok),
                 Err(ty_err) => tcx.sess.delay_span_bug(
@@ -788,7 +834,7 @@ pub fn check_item_type<'tcx>(tcx: TyCtxt<'tcx>, it: &'tcx hir::Item<'tcx>) {
             check_type_params_are_used(tcx, &generics, pty_ty);
         }
         hir::ItemKind::ForeignMod { abi, items } => {
-            check_abi(tcx, it.span, abi);
+            check_abi(tcx, it.hir_id(), it.span, abi);
 
             if abi == Abi::RustIntrinsic {
                 for item in items {
@@ -1125,7 +1171,7 @@ pub(super) fn check_representable(tcx: TyCtxt<'_>, sp: Span, item_def_id: LocalD
     // recursive type. It is only necessary to throw an error on those that
     // contain themselves. For case 2, there must be an inner type that will be
     // caught by case 1.
-    match rty.is_representable(tcx, sp) {
+    match representability::ty_is_representable(tcx, rty, sp) {
         Representability::SelfRecursive(spans) => {
             recursive_type_with_infinite_size_error(tcx, item_def_id.to_def_id(), spans);
             return false;
@@ -1174,10 +1220,19 @@ pub fn check_simd(tcx: TyCtxt<'_>, sp: Span, def_id: LocalDefId) {
                 }
             }
 
+            // Check that we use types valid for use in the lanes of a SIMD "vector register"
+            // These are scalar types which directly match a "machine" type
+            // Yes: Integers, floats, "thin" pointers
+            // No: char, "fat" pointers, compound types
             match e.kind() {
-                ty::Param(_) => { /* struct<T>(T, T, T, T) is ok */ }
-                _ if e.is_machine() => { /* struct(u8, u8, u8, u8) is ok */ }
-                ty::Array(ty, _c) if ty.is_machine() => { /* struct([f32; 4]) */ }
+                ty::Param(_) => (), // pass struct<T>(T, T, T, T) through, let monomorphization catch errors
+                ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::RawPtr(_) => (), // struct(u8, u8, u8, u8) is ok
+                ty::Array(t, _clen)
+                    if matches!(
+                        t.kind(),
+                        ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::RawPtr(_)
+                    ) =>
+                { /* struct([f32; 4]) is ok */ }
                 _ => {
                     struct_span_err!(
                         tcx.sess,
@@ -1333,7 +1388,7 @@ pub(super) fn check_transparent<'tcx>(tcx: TyCtxt<'tcx>, sp: Span, adt: &'tcx ty
     let non_zst_fields =
         field_infos.clone().filter_map(|(span, zst, _align1)| if !zst { Some(span) } else { None });
     let non_zst_count = non_zst_fields.clone().count();
-    if non_zst_count != 1 {
+    if non_zst_count >= 2 {
         bad_non_zero_sized_fields(tcx, adt, non_zst_count, non_zst_fields, sp);
     }
     for (span, zst, align1) in field_infos {
@@ -1410,7 +1465,7 @@ fn check_enum<'tcx>(
     }
 
     let mut disr_vals: Vec<Discr<'tcx>> = Vec::with_capacity(vs.len());
-    for ((_, discr), v) in def.discriminants(tcx).zip(vs) {
+    for ((_, discr), v) in iter::zip(def.discriminants(tcx), vs) {
         // Check for duplicate discriminant values
         if let Some(i) = disr_vals.iter().position(|&x| x.val == discr.val) {
             let variant_did = def.variants[VariantIdx::new(i)].def_id;

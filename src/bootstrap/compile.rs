@@ -65,7 +65,9 @@ impl Step for Std {
 
         // These artifacts were already copied (in `impl Step for Sysroot`).
         // Don't recompile them.
-        if builder.config.download_rustc {
+        // NOTE: the ABI of the beta compiler is different from the ABI of the downloaded compiler,
+        // so its artifacts can't be reused.
+        if builder.config.download_rustc && compiler.stage != 0 {
             return;
         }
 
@@ -197,8 +199,9 @@ fn copy_self_contained_objects(
                 DependencyType::TargetSelfContained,
             );
         }
+        let crt_path = builder.ensure(native::CrtBeginEnd { target });
         for &obj in &["crtbegin.o", "crtbeginS.o", "crtend.o", "crtendS.o"] {
-            let src = compiler_file(builder, builder.cc(target), target, obj);
+            let src = crt_path.join(obj);
             let target = libdir_self_contained.join(obj);
             builder.copy(&src, &target);
             target_deps.push((target, DependencyType::TargetSelfContained));
@@ -266,7 +269,9 @@ pub fn std_cargo(builder: &Builder<'_>, target: TargetSelection, stage: u32, car
 
     if builder.no_std(target) == Some(true) {
         let mut features = "compiler-builtins-mem".to_string();
-        features.push_str(compiler_builtins_c_feature);
+        if !target.starts_with("bpf") {
+            features.push_str(compiler_builtins_c_feature);
+        }
 
         // for no-std targets we only compile a few no_std crates
         cargo
@@ -323,6 +328,11 @@ pub fn std_cargo(builder: &Builder<'_>, target: TargetSelection, stage: u32, car
     if target.contains("riscv") {
         cargo.rustflag("-Cforce-unwind-tables=yes");
     }
+
+    let html_root =
+        format!("-Zcrate-attr=doc(html_root_url=\"{}/\")", builder.doc_rust_lang_org_channel(),);
+    cargo.rustflag(&html_root);
+    cargo.rustdocflag(&html_root);
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -460,11 +470,13 @@ impl Step for StartupObjects {
             let dst_file = &dst_dir.join(file.to_string() + ".o");
             if !up_to_date(src_file, dst_file) {
                 let mut cmd = Command::new(&builder.initial_rustc);
+                cmd.env("RUSTC_BOOTSTRAP", "1");
+                if !builder.local_rebuild {
+                    // a local_rebuild compiler already has stage1 features
+                    cmd.arg("--cfg").arg("bootstrap");
+                }
                 builder.run(
-                    cmd.env("RUSTC_BOOTSTRAP", "1")
-                        .arg("--cfg")
-                        .arg("bootstrap")
-                        .arg("--target")
+                    cmd.arg("--target")
                         .arg(target.rustc_target_arg())
                         .arg("--emit=obj")
                         .arg("-o")
@@ -513,7 +525,9 @@ impl Step for Rustc {
         let compiler = self.compiler;
         let target = self.target;
 
-        if builder.config.download_rustc {
+        // NOTE: the ABI of the beta compiler is different from the ABI of the downloaded compiler,
+        // so its artifacts can't be reused.
+        if builder.config.download_rustc && compiler.stage != 0 {
             // Copy the existing artifacts instead of rebuilding them.
             // NOTE: this path is only taken for tools linking to rustc-dev.
             builder.ensure(Sysroot { compiler });
@@ -622,8 +636,7 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
     cargo
         .env("CFG_RELEASE", builder.rust_release())
         .env("CFG_RELEASE_CHANNEL", &builder.config.channel)
-        .env("CFG_VERSION", builder.rust_version())
-        .env("CFG_PREFIX", builder.config.prefix.clone().unwrap_or_default());
+        .env("CFG_VERSION", builder.rust_version());
 
     let libdir_relative = builder.config.libdir_relative().unwrap_or_else(|| Path::new("lib"));
     cargo.env("CFG_LIBDIR_RELATIVE", libdir_relative);
@@ -642,6 +655,7 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
     }
     if builder.config.rustc_parallel {
         cargo.rustflag("--cfg=parallel_compiler");
+        cargo.rustdocflag("--cfg=parallel_compiler");
     }
     if builder.config.rust_verify_llvm_ir {
         cargo.env("RUSTC_VERIFY_LLVM_IR", "1");
@@ -934,14 +948,15 @@ impl Step for Sysroot {
         t!(fs::create_dir_all(&sysroot));
 
         // If we're downloading a compiler from CI, we can use the same compiler for all stages other than 0.
-        if builder.config.download_rustc {
+        if builder.config.download_rustc && compiler.stage != 0 {
             assert_eq!(
                 builder.config.build, compiler.host,
                 "Cross-compiling is not yet supported with `download-rustc`",
             );
             // Copy the compiler into the correct sysroot.
-            let stage0_dir = builder.config.out.join(&*builder.config.build.triple).join("stage0");
-            builder.cp_r(&stage0_dir, &sysroot);
+            let ci_rustc_dir =
+                builder.config.out.join(&*builder.config.build.triple).join("ci-rustc");
+            builder.cp_r(&ci_rustc_dir, &sysroot);
             return INTERNER.intern_path(sysroot);
         }
 
@@ -1093,6 +1108,13 @@ impl Step for Assemble {
             let src_exe = exe("lld", target_compiler.host);
             let dst_exe = exe("rust-lld", target_compiler.host);
             builder.copy(&lld_install.join("bin").join(&src_exe), &libdir_bin.join(&dst_exe));
+            // for `-Z gcc-ld=lld`
+            let gcc_ld_dir = libdir_bin.join("gcc-ld");
+            t!(fs::create_dir(&gcc_ld_dir));
+            builder.copy(
+                &lld_install.join("bin").join(&src_exe),
+                &gcc_ld_dir.join(exe("ld", target_compiler.host)),
+            );
         }
 
         // Similarly, copy `llvm-dwp` into libdir for Split DWARF. Only copy it when the LLVM
@@ -1344,7 +1366,7 @@ pub fn stream_cargo(
 
     // Make sure Cargo actually succeeded after we read all of its stdout.
     let status = t!(child.wait());
-    if !status.success() {
+    if builder.is_verbose() && !status.success() {
         eprintln!(
             "command did not execute successfully: {:?}\n\
                   expected success, got: {}",

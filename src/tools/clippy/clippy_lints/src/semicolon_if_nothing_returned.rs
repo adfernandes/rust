@@ -1,4 +1,7 @@
-use crate::utils::{in_macro, snippet_with_macro_callsite, span_lint_and_sugg, sugg};
+use crate::rustc_lint::LintContext;
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::source::snippet_with_macro_callsite;
+use clippy_utils::{in_macro, sugg};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir::{Block, ExprKind};
@@ -6,11 +9,11 @@ use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 
 declare_clippy_lint! {
-    /// **What it does:** Looks for blocks of expressions and fires if the last expression returns `()`
-    /// but is not followed by a semicolon.
+    /// **What it does:** Looks for blocks of expressions and fires if the last expression returns
+    /// `()` but is not followed by a semicolon.
     ///
-    /// **Why is this bad?** The semicolon might be optional but when
-    /// extending the block with new code, it doesn't require a change in previous last line.
+    /// **Why is this bad?** The semicolon might be optional but when extending the block with new
+    /// code, it doesn't require a change in previous last line.
     ///
     /// **Known problems:** None.
     ///
@@ -28,7 +31,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     pub SEMICOLON_IF_NOTHING_RETURNED,
-    restriction,
+    pedantic,
     "add a semicolon if nothing is returned"
 }
 
@@ -43,13 +46,14 @@ impl LateLintPass<'_> for SemicolonIfNothingReturned {
             if t_expr.is_unit();
             if let snippet = snippet_with_macro_callsite(cx, expr.span, "}");
             if !snippet.ends_with('}');
+            if cx.sess().source_map().is_multiline(block.span);
             then {
                 // filter out the desugared `for` loop
                 if let ExprKind::DropTemps(..) = &expr.kind {
                     return;
                 }
 
-                let sugg = sugg::Sugg::hir_with_macro_callsite(cx, &expr, "..");
+                let sugg = sugg::Sugg::hir_with_macro_callsite(cx, expr, "..");
                 let suggestion = format!("{0};", sugg);
                 span_lint_and_sugg(
                     cx,

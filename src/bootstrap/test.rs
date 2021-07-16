@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use build_helper::{self, output, t};
 
@@ -108,11 +108,41 @@ impl Step for Linkcheck {
     /// documentation to ensure we don't have a bunch of dead ones.
     fn run(self, builder: &Builder<'_>) {
         let host = self.host;
+        let hosts = &builder.hosts;
+        let targets = &builder.targets;
+
+        // if we have different hosts and targets, some things may be built for
+        // the host (e.g. rustc) and others for the target (e.g. std). The
+        // documentation built for each will contain broken links to
+        // docs built for the other platform (e.g. rustc linking to cargo)
+        if (hosts != targets) && !hosts.is_empty() && !targets.is_empty() {
+            panic!(
+                "Linkcheck currently does not support builds with different hosts and targets.
+You can skip linkcheck with --exclude src/tools/linkchecker"
+            );
+        }
 
         builder.info(&format!("Linkcheck ({})", host));
 
+        // Test the linkchecker itself.
+        let bootstrap_host = builder.config.build;
+        let compiler = builder.compiler(0, bootstrap_host);
+        let cargo = tool::prepare_tool_cargo(
+            builder,
+            compiler,
+            Mode::ToolBootstrap,
+            bootstrap_host,
+            "test",
+            "src/tools/linkchecker",
+            SourceType::InTree,
+            &[],
+        );
+        try_run(builder, &mut cargo.into());
+
+        // Build all the default documentation.
         builder.default_doc(&[]);
 
+        // Run the linkchecker.
         let _time = util::timeit(&builder);
         try_run(
             builder,
@@ -122,11 +152,55 @@ impl Step for Linkcheck {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let builder = run.builder;
-        run.path("src/tools/linkchecker").default_condition(builder.config.docs)
+        let run = run.path("src/tools/linkchecker");
+        run.default_condition(builder.config.docs)
     }
 
     fn make_run(run: RunConfig<'_>) {
         run.builder.ensure(Linkcheck { host: run.target });
+    }
+}
+
+fn check_if_tidy_is_installed() -> bool {
+    Command::new("tidy")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .status()
+        .map_or(false, |status| status.success())
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct HtmlCheck {
+    target: TargetSelection,
+}
+
+impl Step for HtmlCheck {
+    type Output = ();
+    const DEFAULT: bool = true;
+    const ONLY_HOSTS: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        let run = run.path("src/tools/html-checker");
+        run.lazy_default_condition(Box::new(check_if_tidy_is_installed))
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(HtmlCheck { target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        if !check_if_tidy_is_installed() {
+            eprintln!("not running HTML-check tool because `tidy` is missing");
+            eprintln!(
+                "Note that `tidy` is not the in-tree `src/tools/tidy` but needs to be installed"
+            );
+            panic!("Cannot run html-check tests");
+        }
+        // Ensure that a few different kinds of documentation are available.
+        builder.default_doc(&[]);
+        builder.ensure(crate::doc::Rustc { target: self.target, stage: builder.top_stage });
+
+        try_run(builder, builder.tool_cmd(Tool::HtmlChecker).arg(builder.doc_out(self.target)));
     }
 }
 
@@ -169,6 +243,7 @@ impl Step for Cargotest {
             builder,
             cmd.arg(&cargo)
                 .arg(&out_dir)
+                .args(builder.config.cmd.test_args())
                 .env("RUSTC", builder.rustc(compiler))
                 .env("RUSTDOC", builder.rustdoc(compiler)),
         );
@@ -304,15 +379,9 @@ impl Step for Rustfmt {
         let host = self.host;
         let compiler = builder.compiler(stage, host);
 
-        let build_result = builder.ensure(tool::Rustfmt {
-            compiler,
-            target: self.host,
-            extra_features: Vec::new(),
-        });
-        if build_result.is_none() {
-            eprintln!("failed to test rustfmt: could not build");
-            return;
-        }
+        builder
+            .ensure(tool::Rustfmt { compiler, target: self.host, extra_features: Vec::new() })
+            .expect("in-tree tool");
 
         let mut cargo = tool::prepare_tool_cargo(
             builder,
@@ -331,9 +400,58 @@ impl Step for Rustfmt {
 
         cargo.add_rustc_lib_path(builder, compiler);
 
-        if try_run(builder, &mut cargo.into()) {
-            builder.save_toolstate("rustfmt", ToolState::TestPass);
-        }
+        builder.run(&mut cargo.into());
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct RustDemangler {
+    stage: u32,
+    host: TargetSelection,
+}
+
+impl Step for RustDemangler {
+    type Output = ();
+    const ONLY_HOSTS: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.path("src/tools/rust-demangler")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(RustDemangler { stage: run.builder.top_stage, host: run.target });
+    }
+
+    /// Runs `cargo test` for rust-demangler.
+    fn run(self, builder: &Builder<'_>) {
+        let stage = self.stage;
+        let host = self.host;
+        let compiler = builder.compiler(stage, host);
+
+        let rust_demangler = builder
+            .ensure(tool::RustDemangler { compiler, target: self.host, extra_features: Vec::new() })
+            .expect("in-tree tool");
+        let mut cargo = tool::prepare_tool_cargo(
+            builder,
+            compiler,
+            Mode::ToolRustc,
+            host,
+            "test",
+            "src/tools/rust-demangler",
+            SourceType::InTree,
+            &[],
+        );
+
+        let dir = testdir(builder, compiler.host);
+        t!(fs::create_dir_all(&dir));
+
+        cargo.env("RUST_DEMANGLER_DRIVER_PATH", rust_demangler);
+
+        cargo.arg("--").args(builder.config.cmd.test_args());
+
+        cargo.add_rustc_lib_path(builder, compiler);
+
+        builder.run(&mut cargo.into());
     }
 }
 
@@ -391,6 +509,7 @@ impl Step for Miri {
                 SourceType::Submodule,
                 &[],
             );
+            cargo.add_rustc_lib_path(builder, compiler);
             cargo.arg("--").arg("miri").arg("setup");
 
             // Tell `cargo miri setup` where to find the sources.
@@ -442,6 +561,7 @@ impl Step for Miri {
                 SourceType::Submodule,
                 &[],
             );
+            cargo.add_rustc_lib_path(builder, compiler);
 
             // miri tests need to know about the stage sysroot
             cargo.env("MIRI_SYSROOT", miri_sysroot);
@@ -450,9 +570,14 @@ impl Step for Miri {
 
             cargo.arg("--").args(builder.config.cmd.test_args());
 
-            cargo.add_rustc_lib_path(builder, compiler);
+            let mut cargo = Command::from(cargo);
+            if !try_run(builder, &mut cargo) {
+                return;
+            }
 
-            if !try_run(builder, &mut cargo.into()) {
+            // # Run `cargo test` with `-Zmir-opt-level=4`.
+            cargo.env("MIRIFLAGS", "-O -Zmir-opt-level=4");
+            if !try_run(builder, &mut cargo) {
                 return;
             }
 
@@ -560,6 +685,26 @@ impl Step for Clippy {
 
         cargo.add_rustc_lib_path(builder, compiler);
 
+        if builder.try_run(&mut cargo.into()) {
+            // The tests succeeded; nothing to do.
+            return;
+        }
+
+        if !builder.config.cmd.bless() {
+            std::process::exit(1);
+        }
+
+        let mut cargo = builder.cargo(compiler, Mode::ToolRustc, SourceType::InTree, host, "run");
+        cargo.arg("-p").arg("clippy_dev");
+        // clippy_dev gets confused if it can't find `clippy/Cargo.toml`
+        cargo.current_dir(&builder.src.join("src").join("tools").join("clippy"));
+        if builder.config.rust_optimize {
+            cargo.env("PROFILE", "release");
+        } else {
+            cargo.env("PROFILE", "debug");
+        }
+        cargo.arg("--");
+        cargo.arg("bless");
         builder.run(&mut cargo.into());
     }
 }
@@ -597,7 +742,7 @@ impl Step for RustdocTheme {
         let rustdoc = builder.out.join("bootstrap/debug/rustdoc");
         let mut cmd = builder.tool_cmd(Tool::RustdocTheme);
         cmd.arg(rustdoc.to_str().unwrap())
-            .arg(builder.src.join("src/librustdoc/html/static/themes").to_str().unwrap())
+            .arg(builder.src.join("src/librustdoc/html/static/css/themes").to_str().unwrap())
             .env("RUSTC_STAGE", self.compiler.stage.to_string())
             .env("RUSTC_SYSROOT", builder.sysroot(self.compiler))
             .env("RUSTDOC_LIBDIR", builder.sysroot_libdir(self.compiler, self.compiler.host))
@@ -689,6 +834,24 @@ impl Step for RustdocJSNotStd {
     }
 }
 
+fn check_if_browser_ui_test_is_installed_global(npm: &Path, global: bool) -> bool {
+    let mut command = Command::new(&npm);
+    command.arg("list").arg("--depth=0");
+    if global {
+        command.arg("--global");
+    }
+    let lines = command
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or(String::new());
+    lines.contains(&" browser-ui-test@")
+}
+
+fn check_if_browser_ui_test_is_installed(npm: &Path) -> bool {
+    check_if_browser_ui_test_is_installed_global(npm, false)
+        || check_if_browser_ui_test_is_installed_global(npm, true)
+}
+
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct RustdocGUI {
     pub target: TargetSelection,
@@ -701,7 +864,17 @@ impl Step for RustdocGUI {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src/test/rustdoc-gui")
+        let builder = run.builder;
+        let run = run.suite_path("src/test/rustdoc-gui");
+        run.lazy_default_condition(Box::new(move || {
+            builder.config.nodejs.is_some()
+                && builder
+                    .config
+                    .npm
+                    .as_ref()
+                    .map(|p| check_if_browser_ui_test_is_installed(p))
+                    .unwrap_or(false)
+        }))
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -710,54 +883,62 @@ impl Step for RustdocGUI {
     }
 
     fn run(self, builder: &Builder<'_>) {
-        if let (Some(nodejs), Some(npm)) = (&builder.config.nodejs, &builder.config.npm) {
-            builder.ensure(compile::Std { compiler: self.compiler, target: self.target });
+        let nodejs = builder.config.nodejs.as_ref().expect("nodejs isn't available");
+        let npm = builder.config.npm.as_ref().expect("npm isn't available");
 
-            // The goal here is to check if the necessary packages are installed, and if not, we
-            // display a warning and move on.
-            let mut command = Command::new(&npm);
-            command.arg("list").arg("--depth=0");
-            let lines = command
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-                .unwrap_or(String::new());
-            if !lines.contains(&" browser-ui-test@") {
-                println!(
-                    "warning: rustdoc-gui test suite cannot be run because npm `browser-ui-test` \
-                     dependency is missing",
-                );
-                println!(
-                    "If you want to install the `{0}` dependency, run `npm install {0}`",
-                    "browser-ui-test",
-                );
-                return;
-            }
+        builder.ensure(compile::Std { compiler: self.compiler, target: self.target });
 
-            let out_dir = builder.test_out(self.target).join("rustdoc-gui");
-            let mut command = builder.rustdoc_cmd(self.compiler);
-            command.arg("src/test/rustdoc-gui/lib.rs").arg("-o").arg(&out_dir);
-            builder.run(&mut command);
-
-            for file in fs::read_dir("src/test/rustdoc-gui").unwrap() {
-                let file = file.unwrap();
-                let file_path = file.path();
-                let file_name = file.file_name();
-
-                if !file_name.to_str().unwrap().ends_with(".goml") {
-                    continue;
-                }
-                let mut command = Command::new(&nodejs);
-                command
-                    .arg("src/tools/rustdoc-gui/tester.js")
-                    .arg("--doc-folder")
-                    .arg(out_dir.join("test_docs"))
-                    .arg("--test-file")
-                    .arg(file_path);
-                builder.run(&mut command);
-            }
-        } else {
-            builder.info("No nodejs found, skipping \"src/test/rustdoc-gui\" tests");
+        // The goal here is to check if the necessary packages are installed, and if not, we
+        // panic.
+        if !check_if_browser_ui_test_is_installed(&npm) {
+            eprintln!(
+                "error: rustdoc-gui test suite cannot be run because npm `browser-ui-test` \
+                 dependency is missing",
+            );
+            eprintln!(
+                "If you want to install the `{0}` dependency, run `npm install {0}`",
+                "browser-ui-test",
+            );
+            panic!("Cannot run rustdoc-gui tests");
         }
+
+        let out_dir = builder.test_out(self.target).join("rustdoc-gui");
+
+        // We remove existing folder to be sure there won't be artifacts remaining.
+        let _ = fs::remove_dir_all(&out_dir);
+
+        let src_path = "src/test/rustdoc-gui/src";
+        // We generate docs for the libraries present in the rustdoc-gui's src folder.
+        let mut cargo = Command::new(&builder.initial_cargo);
+        cargo
+            .arg("doc")
+            .arg("--workspace")
+            .arg("--target-dir")
+            .arg(&out_dir)
+            .env("RUSTDOC", builder.rustdoc(self.compiler))
+            .env("RUSTC", builder.rustc(self.compiler))
+            .current_dir(&builder.build.src.join(src_path));
+        builder.run(&mut cargo);
+
+        // We now run GUI tests.
+        let mut command = Command::new(&nodejs);
+        command
+            .arg(builder.build.src.join("src/tools/rustdoc-gui/tester.js"))
+            .arg("--doc-folder")
+            .arg(out_dir.join("doc"))
+            .arg("--tests-folder")
+            .arg(builder.build.src.join("src/test/rustdoc-gui"));
+        for path in &builder.paths {
+            if let Some(name) = path.file_name().and_then(|f| f.to_str()) {
+                if name.ends_with(".goml") {
+                    command.arg("--file").arg(name);
+                }
+            }
+        }
+        for test_arg in builder.config.cmd.test_args() {
+            command.arg(test_arg);
+        }
+        builder.run(&mut command);
     }
 }
 
@@ -782,6 +963,7 @@ impl Step for Tidy {
         cmd.arg(&builder.src);
         cmd.arg(&builder.initial_cargo);
         cmd.arg(&builder.out);
+        cmd.arg(builder.jobs().to_string());
         if builder.is_verbose() {
             cmd.arg("--verbose");
         }
@@ -791,7 +973,20 @@ impl Step for Tidy {
 
         if builder.config.channel == "dev" || builder.config.channel == "nightly" {
             builder.info("fmt check");
-            crate::format::format(&builder.build, !builder.config.cmd.bless());
+            if builder.config.initial_rustfmt.is_none() {
+                let inferred_rustfmt_dir = builder.config.initial_rustc.parent().unwrap();
+                eprintln!(
+                    "\
+error: no `rustfmt` binary found in {PATH}
+info: `rust.channel` is currently set to \"{CHAN}\"
+help: if you are testing a beta branch, set `rust.channel` to \"beta\" in the `config.toml` file
+help: to skip test's attempt to check tidiness, pass `--exclude src/tools/tidy` to `x.py test`",
+                    PATH = inferred_rustfmt_dir.display(),
+                    CHAN = builder.config.channel,
+                );
+                std::process::exit(1);
+            }
+            crate::format::format(&builder.build, !builder.config.cmd.bless(), &[]);
         }
     }
 
@@ -1092,7 +1287,10 @@ note: if you're sure you want to do this, please open an issue as to why. In the
         }
 
         if mode == "run-make" && suite.ends_with("fulldeps") {
-            cmd.arg("--rust-demangler-path").arg(builder.tool_exe(Tool::RustDemangler));
+            let rust_demangler = builder
+                .ensure(tool::RustDemangler { compiler, target, extra_features: Vec::new() })
+                .expect("in-tree tool");
+            cmd.arg("--rust-demangler-path").arg(rust_demangler);
         }
 
         cmd.arg("--src-base").arg(builder.src.join("src/test").join(suite));
@@ -1118,6 +1316,11 @@ note: if you're sure you want to do this, please open an issue as to why. In the
             cmd.arg(pass);
         }
 
+        if let Some(ref run) = builder.config.cmd.run() {
+            cmd.arg("--run");
+            cmd.arg(run);
+        }
+
         if let Some(ref nodejs) = builder.config.nodejs {
             cmd.arg("--nodejs").arg(nodejs);
         }
@@ -1132,7 +1335,6 @@ note: if you're sure you want to do this, please open an issue as to why. In the
             }
         }
         flags.push(format!("-Cdebuginfo={}", builder.config.rust_debuginfo_level_tests));
-        flags.push("-Zunstable-options".to_string());
         flags.push(builder.config.cmd.rustc_args().join(" "));
 
         if let Some(linker) = builder.linker(target) {
@@ -1141,16 +1343,12 @@ note: if you're sure you want to do this, please open an issue as to why. In the
 
         let mut hostflags = flags.clone();
         hostflags.push(format!("-Lnative={}", builder.test_helpers_out(compiler.host).display()));
-        if builder.is_fuse_ld_lld(compiler.host) {
-            hostflags.push("-Clink-args=-fuse-ld=lld".to_string());
-        }
+        hostflags.extend(builder.lld_flags(compiler.host));
         cmd.arg("--host-rustcflags").arg(hostflags.join(" "));
 
         let mut targetflags = flags;
         targetflags.push(format!("-Lnative={}", builder.test_helpers_out(target).display()));
-        if builder.is_fuse_ld_lld(target) {
-            targetflags.push("-Clink-args=-fuse-ld=lld".to_string());
-        }
+        targetflags.extend(builder.lld_flags(target));
         cmd.arg("--target-rustcflags").arg(targetflags.join(" "));
 
         cmd.arg("--docck-python").arg(builder.python());
@@ -1342,6 +1540,7 @@ note: if you're sure you want to do this, please open an issue as to why. In the
             }
         }
         cmd.env("RUSTC_BOOTSTRAP", "1");
+        cmd.env("DOC_RUST_LANG_ORG_CHANNEL", builder.doc_rust_lang_org_channel());
         builder.add_rust_test_threads(&mut cmd);
 
         if builder.config.sanitizers_enabled(target) {
@@ -1371,6 +1570,8 @@ note: if you're sure you want to do this, please open an issue as to why. In the
         }
 
         cmd.env("BOOTSTRAP_CARGO", &builder.initial_cargo);
+
+        cmd.arg("--channel").arg(&builder.config.channel);
 
         builder.ci_env.force_coloring_in_ci(&mut cmd);
 
@@ -1598,6 +1799,9 @@ fn markdown_test(builder: &Builder<'_>, compiler: Compiler, markdown: &Path) -> 
     builder.info(&format!("doc tests for: {}", markdown.display()));
     let mut cmd = builder.rustdoc_cmd(compiler);
     builder.add_rust_test_threads(&mut cmd);
+    // allow for unstable options such as new editions
+    cmd.arg("-Z");
+    cmd.arg("unstable-options");
     cmd.arg("--test");
     cmd.arg(markdown);
     cmd.env("RUSTC_BOOTSTRAP", "1");

@@ -3,8 +3,6 @@
 //! This library contains the tidy lints and exposes it
 //! to be used by tools.
 
-#![cfg_attr(bootstrap, feature(str_split_once))]
-
 use std::fs::File;
 use std::io::Read;
 use walkdir::{DirEntry, WalkDir};
@@ -49,12 +47,14 @@ pub mod extdeps;
 pub mod features;
 pub mod pal;
 pub mod style;
+pub mod target_specific_tests;
 pub mod ui_tests;
 pub mod unit_tests;
 pub mod unstable_book;
 
 fn filter_dirs(path: &Path) -> bool {
     let skip = [
+        "tidy-test-file",
         "compiler/rustc_codegen_cranelift",
         "src/llvm-project",
         "library/backtrace",

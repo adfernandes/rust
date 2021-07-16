@@ -126,6 +126,10 @@ x--expand-yaml-anchors--remove:
         run: src/ci/scripts/should-skip-this.sh
         <<: *step
 
+      - name: ensure the channel matches the target branch
+        run: src/ci/scripts/verify-channel.sh
+        <<: *step
+
       - name: configure GitHub Actions to kill the build when outdated
         uses: rust-lang/simpleinfra/github-actions/cancel-outdated-builds@master
         with:
@@ -280,7 +284,7 @@ jobs:
           - name: mingw-check
             <<: *job-linux-xl
 
-          - name: x86_64-gnu-llvm-9
+          - name: x86_64-gnu-llvm-10
             <<: *job-linux-xl
 
           - name: x86_64-gnu-tools
@@ -403,6 +407,17 @@ jobs:
           - name: x86_64-gnu
             <<: *job-linux-xl
 
+          # This job ensures commits landing on nightly still pass the full
+          # test suite on the stable channel. There are some UI tests that
+          # depend on the channel being built (for example if they include the
+          # channel name on the output), and this builder prevents landing
+          # changes that would result in broken builds after a promotion.
+          - name: x86_64-gnu-stable
+            env:
+              IMAGE: x86_64-gnu
+              RUST_CI_OVERRIDE_RELEASE_CHANNEL: stable
+            <<: *job-linux-xl
+
           - name: x86_64-gnu-aux
             <<: *job-linux-xl
 
@@ -412,7 +427,7 @@ jobs:
           - name: x86_64-gnu-distcheck
             <<: *job-linux-xl
 
-          - name: x86_64-gnu-llvm-9
+          - name: x86_64-gnu-llvm-10
             env:
               RUST_BACKTRACE: 1
             <<: *job-linux-xl
@@ -655,7 +670,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'rust-lang-ci/rust'
     steps:
       - name: checkout the source code
-        uses: actions/checkout@v1
+        uses: actions/checkout@v2
         with:
           fetch-depth: 2
 

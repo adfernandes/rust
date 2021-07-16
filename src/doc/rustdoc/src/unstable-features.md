@@ -88,26 +88,28 @@ Book][unstable-doc-cfg] and [its tracking issue][issue-doc-cfg].
 [unstable-doc-cfg]: ../unstable-book/language-features/doc-cfg.html
 [issue-doc-cfg]: https://github.com/rust-lang/rust/issues/43781
 
-### Adding your trait to the "Important Traits" dialog
+### Adding your trait to the "Notable traits" dialog
 
-Rustdoc keeps a list of a few traits that are believed to be "fundamental" to a given type when
-implemented on it. These traits are intended to be the primary interface for their types, and are
-often the only thing available to be documented on their types. For this reason, Rustdoc will track
-when a given type implements one of these traits and call special attention to it when a function
-returns one of these types. This is the "Important Traits" dialog, visible as a circle-i button next
-to the function, which, when clicked, shows the dialog.
+Rustdoc keeps a list of a few traits that are believed to be "fundamental" to
+types that implement them. These traits are intended to be the primary interface
+for their implementers, and are often most of the API available to be documented
+on their types. For this reason, Rustdoc will track when a given type implements
+one of these traits and call special attention to it when a function returns one
+of these types. This is the "Notable traits" dialog, accessible as a circled `i`
+button next to the function, which, when clicked, shows the dialog.
 
-In the standard library, the traits that qualify for inclusion are `Iterator`, `io::Read`, and
-`io::Write`. However, rather than being implemented as a hard-coded list, these traits have a
-special marker attribute on them: `#[doc(spotlight)]`. This means that you could apply this
-attribute to your own trait to include it in the "Important Traits" dialog in documentation.
+In the standard library, some of the traits that are part of this list are
+`Iterator`, `Future`, `io::Read`, and `io::Write`. However, rather than being
+implemented as a hard-coded list, these traits have a special marker attribute
+on them: `#[doc(notable_trait)]`. This means that you can apply this attribute
+to your own trait to include it in the "Notable traits" dialog in documentation.
 
-The `#[doc(spotlight)]` attribute currently requires the `#![feature(doc_spotlight)]` feature gate.
-For more information, see [its chapter in the Unstable Book][unstable-spotlight] and [its tracking
-issue][issue-spotlight].
+The `#[doc(notable_trait)]` attribute currently requires the `#![feature(doc_notable_trait)]`
+feature gate. For more information, see [its chapter in the Unstable Book][unstable-notable_trait]
+and [its tracking issue][issue-notable_trait].
 
-[unstable-spotlight]: ../unstable-book/language-features/doc-spotlight.html
-[issue-spotlight]: https://github.com/rust-lang/rust/issues/45040
+[unstable-notable_trait]: ../unstable-book/language-features/doc-notable-trait.html
+[issue-notable_trait]: https://github.com/rust-lang/rust/issues/45040
 
 ### Exclude certain dependencies from documentation
 
@@ -128,22 +130,6 @@ Book][unstable-masked] and [its tracking issue][issue-masked].
 
 [unstable-masked]: ../unstable-book/language-features/doc-masked.html
 [issue-masked]: https://github.com/rust-lang/rust/issues/44027
-
-### Include external files as API documentation
-
-As designed in [RFC 1990], Rustdoc can read an external file to use as a type's documentation. This
-is useful if certain documentation is so long that it would break the flow of reading the source.
-Instead of writing it all inline, writing `#[doc(include = "sometype.md")]` will ask Rustdoc to
-instead read that file and use it as if it were written inline.
-
-[RFC 1990]: https://github.com/rust-lang/rfcs/pull/1990
-
-`#[doc(include = "...")]` currently requires the `#![feature(external_doc)]` feature gate. For more
-information, see [its chapter in the Unstable Book][unstable-include] and [its tracking
-issue][issue-include].
-
-[unstable-include]: ../unstable-book/language-features/external-doc.html
-[issue-include]: https://github.com/rust-lang/rust/issues/44732
 
 ## Unstable command-line arguments
 

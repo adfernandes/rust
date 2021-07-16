@@ -57,7 +57,8 @@ use crate::ops::Try;
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
 pub struct Map<I, F> {
-    iter: I,
+    // Used for `SplitWhitespace` and `SplitAsciiWhitespace` `as_str` methods
+    pub(crate) iter: I,
     f: F,
 }
 
@@ -109,7 +110,7 @@ where
     where
         Self: Sized,
         G: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         self.iter.try_fold(init, map_try_fold(&mut self.f, g))
     }
@@ -121,6 +122,7 @@ where
         self.iter.fold(init, map_fold(self.f, g))
     }
 
+    #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> B
     where
         Self: TrustedRandomAccess,
@@ -145,7 +147,7 @@ where
     where
         Self: Sized,
         G: FnMut(Acc, Self::Item) -> R,
-        R: Try<Ok = Acc>,
+        R: Try<Output = Acc>,
     {
         self.iter.try_rfold(init, map_try_fold(&mut self.f, g))
     }

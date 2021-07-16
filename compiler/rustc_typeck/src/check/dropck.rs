@@ -77,7 +77,7 @@ fn ensure_drop_params_and_item_params_correspond<'tcx>(
     tcx.infer_ctxt().enter(|ref infcx| {
         let impl_param_env = tcx.param_env(self_type_did);
         let tcx = infcx.tcx;
-        let mut fulfillment_cx = TraitEngine::new(tcx);
+        let mut fulfillment_cx = <dyn TraitEngine<'_>>::new(tcx);
 
         let named_type = tcx.type_of(self_type_did);
 
@@ -310,6 +310,7 @@ impl TypeRelation<'tcx> for SimpleEqRelation<'tcx> {
     fn relate_with_variance<T: Relate<'tcx>>(
         &mut self,
         _: ty::Variance,
+        _info: ty::VarianceDiagInfo<'tcx>,
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
@@ -354,9 +355,9 @@ impl TypeRelation<'tcx> for SimpleEqRelation<'tcx> {
 
     fn binders<T>(
         &mut self,
-        a: ty::Binder<T>,
-        b: ty::Binder<T>,
-    ) -> RelateResult<'tcx, ty::Binder<T>>
+        a: ty::Binder<'tcx, T>,
+        b: ty::Binder<'tcx, T>,
+    ) -> RelateResult<'tcx, ty::Binder<'tcx, T>>
     where
         T: Relate<'tcx>,
     {

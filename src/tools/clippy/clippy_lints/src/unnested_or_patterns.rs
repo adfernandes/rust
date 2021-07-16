@@ -1,14 +1,16 @@
 #![allow(clippy::wildcard_imports, clippy::enum_glob_use)]
 
-use crate::utils::ast_utils::{eq_field_pat, eq_id, eq_pat, eq_path};
-use crate::utils::{over, span_lint_and_then};
+use clippy_utils::ast_utils::{eq_field_pat, eq_id, eq_maybe_qself, eq_pat, eq_path};
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::{meets_msrv, msrvs, over};
 use rustc_ast::mut_visit::*;
 use rustc_ast::ptr::P;
 use rustc_ast::{self as ast, Pat, PatKind, PatKind::*, DUMMY_NODE_ID};
 use rustc_ast_pretty::pprust;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_semver::RustcVersion;
+use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::DUMMY_SP;
 
 use std::cell::Cell;
@@ -49,34 +51,51 @@ declare_clippy_lint! {
     "unnested or-patterns, e.g., `Foo(Bar) | Foo(Baz) instead of `Foo(Bar | Baz)`"
 }
 
-declare_lint_pass!(UnnestedOrPatterns => [UNNESTED_OR_PATTERNS]);
+#[derive(Clone, Copy)]
+pub struct UnnestedOrPatterns {
+    msrv: Option<RustcVersion>,
+}
+
+impl UnnestedOrPatterns {
+    #[must_use]
+    pub fn new(msrv: Option<RustcVersion>) -> Self {
+        Self { msrv }
+    }
+}
+
+impl_lint_pass!(UnnestedOrPatterns => [UNNESTED_OR_PATTERNS]);
 
 impl EarlyLintPass for UnnestedOrPatterns {
     fn check_arm(&mut self, cx: &EarlyContext<'_>, a: &ast::Arm) {
-        lint_unnested_or_patterns(cx, &a.pat);
+        if meets_msrv(self.msrv.as_ref(), &msrvs::OR_PATTERNS) {
+            lint_unnested_or_patterns(cx, &a.pat);
+        }
     }
 
     fn check_expr(&mut self, cx: &EarlyContext<'_>, e: &ast::Expr) {
-        if let ast::ExprKind::Let(pat, _) = &e.kind {
-            lint_unnested_or_patterns(cx, pat);
+        if meets_msrv(self.msrv.as_ref(), &msrvs::OR_PATTERNS) {
+            if let ast::ExprKind::Let(pat, _) = &e.kind {
+                lint_unnested_or_patterns(cx, pat);
+            }
         }
     }
 
     fn check_param(&mut self, cx: &EarlyContext<'_>, p: &ast::Param) {
-        lint_unnested_or_patterns(cx, &p.pat);
+        if meets_msrv(self.msrv.as_ref(), &msrvs::OR_PATTERNS) {
+            lint_unnested_or_patterns(cx, &p.pat);
+        }
     }
 
     fn check_local(&mut self, cx: &EarlyContext<'_>, l: &ast::Local) {
-        lint_unnested_or_patterns(cx, &l.pat);
+        if meets_msrv(self.msrv.as_ref(), &msrvs::OR_PATTERNS) {
+            lint_unnested_or_patterns(cx, &l.pat);
+        }
     }
+
+    extract_msrv_attr!(EarlyContext);
 }
 
 fn lint_unnested_or_patterns(cx: &EarlyContext<'_>, pat: &Pat) {
-    if !cx.sess.features_untracked().or_patterns {
-        // Do not suggest nesting the patterns if the feature `or_patterns` is not enabled.
-        return;
-    }
-
     if let Ident(.., None) | Lit(_) | Wild | Path(..) | Range(..) | Rest | MacCall(_) = pat.kind {
         // This is a leaf pattern, so cloning is unprofitable.
         return;
@@ -254,16 +273,17 @@ fn transform_with_focus_on_idx(alternatives: &mut Vec<P<Pat>>, focus_idx: usize)
             |k| always_pat!(k, Tuple(ps) => ps),
         ),
         // Transform `S(pre, x, post) | ... | S(pre, y, post)` into `S(pre, x | y, post)`.
-        TupleStruct(path1, ps1) => extend_with_matching_product(
+        TupleStruct(qself1, path1, ps1) => extend_with_matching_product(
             ps1, start, alternatives,
             |k, ps1, idx| matches!(
                 k,
-                TupleStruct(path2, ps2) if eq_path(path1, path2) && eq_pre_post(ps1, ps2, idx)
+                TupleStruct(qself2, path2, ps2)
+                    if eq_maybe_qself(qself1, qself2) && eq_path(path1, path2) && eq_pre_post(ps1, ps2, idx)
             ),
-            |k| always_pat!(k, TupleStruct(_, ps) => ps),
+            |k| always_pat!(k, TupleStruct(_, _, ps) => ps),
         ),
         // Transform a record pattern `S { fp_0, ..., fp_n }`.
-        Struct(path1, fps1, rest1) => extend_with_struct_pat(path1, fps1, *rest1, start, alternatives),
+        Struct(qself1, path1, fps1, rest1) => extend_with_struct_pat(qself1, path1, fps1, *rest1, start, alternatives),
     };
 
     alternatives[focus_idx].kind = focus_kind;
@@ -275,8 +295,9 @@ fn transform_with_focus_on_idx(alternatives: &mut Vec<P<Pat>>, focus_idx: usize)
 /// So when we fixate on some `ident_k: pat_k`, we try to find `ident_k` in the other pattern
 /// and check that all `fp_i` where `i ∈ ((0...n) \ k)` between two patterns are equal.
 fn extend_with_struct_pat(
+    qself1: &Option<ast::QSelf>,
     path1: &ast::Path,
-    fps1: &mut Vec<ast::FieldPat>,
+    fps1: &mut Vec<ast::PatField>,
     rest1: bool,
     start: usize,
     alternatives: &mut Vec<P<Pat>>,
@@ -287,8 +308,9 @@ fn extend_with_struct_pat(
             start,
             alternatives,
             |k| {
-                matches!(k, Struct(path2, fps2, rest2)
+                matches!(k, Struct(qself2, path2, fps2, rest2)
                 if rest1 == *rest2 // If one struct pattern has `..` so must the other.
+                && eq_maybe_qself(qself1, qself2)
                 && eq_path(path1, path2)
                 && fps1.len() == fps2.len()
                 && fps1.iter().enumerate().all(|(idx_1, fp1)| {
@@ -304,7 +326,7 @@ fn extend_with_struct_pat(
                 }))
             },
             // Extract `p2_k`.
-            |k| always_pat!(k, Struct(_, mut fps, _) => fps.swap_remove(pos_in_2.take().unwrap()).pat),
+            |k| always_pat!(k, Struct(_, _, mut fps, _) => fps.swap_remove(pos_in_2.take().unwrap()).pat),
         );
         extend_with_tail_or(&mut fps1[idx].pat, tail_or)
     })

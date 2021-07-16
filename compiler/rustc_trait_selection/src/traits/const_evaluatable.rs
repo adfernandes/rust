@@ -13,7 +13,7 @@ use rustc_hir::def::DefKind;
 use rustc_index::bit_set::BitSet;
 use rustc_index::vec::IndexVec;
 use rustc_infer::infer::InferCtxt;
-use rustc_middle::mir::abstract_const::{Node, NodeId};
+use rustc_middle::mir::abstract_const::{Node, NodeId, NotConstEvaluatable};
 use rustc_middle::mir::interpret::ErrorHandled;
 use rustc_middle::mir::{self, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::subst::{Subst, SubstsRef};
@@ -23,6 +23,7 @@ use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::Span;
 
 use std::cmp;
+use std::iter;
 use std::ops::ControlFlow;
 
 /// Check if a given constant can be evaluated.
@@ -32,7 +33,7 @@ pub fn is_const_evaluatable<'cx, 'tcx>(
     substs: SubstsRef<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     span: Span,
-) -> Result<(), ErrorHandled> {
+) -> Result<(), NotConstEvaluatable> {
     debug!("is_const_evaluatable({:?}, {:?})", def, substs);
     if infcx.tcx.features().const_evaluatable_checked {
         let tcx = infcx.tcx;
@@ -96,6 +97,16 @@ pub fn is_const_evaluatable<'cx, 'tcx>(
 
                         ControlFlow::CONTINUE
                     }
+                    Node::Cast(_, _, ty) => {
+                        let ty = ty.subst(tcx, ct.substs);
+                        if ty.has_infer_types_or_consts() {
+                            failure_kind = FailureKind::MentionsInfer;
+                        } else if ty.has_param_types_or_consts() {
+                            failure_kind = cmp::min(failure_kind, FailureKind::MentionsParam);
+                        }
+
+                        ControlFlow::CONTINUE
+                    }
                     Node::Binop(_, _, _) | Node::UnaryOp(_, _) | Node::FunctionCall(_, _) => {
                         ControlFlow::CONTINUE
                     }
@@ -103,29 +114,10 @@ pub fn is_const_evaluatable<'cx, 'tcx>(
 
                 match failure_kind {
                     FailureKind::MentionsInfer => {
-                        return Err(ErrorHandled::TooGeneric);
+                        return Err(NotConstEvaluatable::MentionsInfer);
                     }
                     FailureKind::MentionsParam => {
-                        // FIXME(const_evaluatable_checked): Better error message.
-                        let mut err =
-                            infcx.tcx.sess.struct_span_err(span, "unconstrained generic constant");
-                        let const_span = tcx.def_span(def.did);
-                        // FIXME(const_evaluatable_checked): Update this suggestion once
-                        // explicit const evaluatable bounds are implemented.
-                        if let Ok(snippet) = infcx.tcx.sess.source_map().span_to_snippet(const_span)
-                        {
-                            err.span_help(
-                                tcx.def_span(def.did),
-                                &format!("try adding a `where` bound using this expression: `where [u8; {}]: Sized`", snippet),
-                            );
-                        } else {
-                            err.span_help(
-                                const_span,
-                                "consider adding a `where` bound for this expression",
-                            );
-                        }
-                        err.emit();
-                        return Err(ErrorHandled::Reported(ErrorReported));
+                        return Err(NotConstEvaluatable::MentionsParam);
                     }
                     FailureKind::Concrete => {
                         // Dealt with below by the same code which handles this
@@ -163,7 +155,11 @@ pub fn is_const_evaluatable<'cx, 'tcx>(
     // and hopefully soon change this to an error.
     //
     // See #74595 for more details about this.
-    let concrete = infcx.const_eval_resolve(param_env, def, substs, None, Some(span));
+    let concrete = infcx.const_eval_resolve(
+        param_env,
+        ty::Unevaluated { def, substs, promoted: None },
+        Some(span),
+    );
 
     if concrete.is_ok() && substs.has_param_types_or_consts() {
         match infcx.tcx.def_kind(def.did) {
@@ -180,34 +176,16 @@ pub fn is_const_evaluatable<'cx, 'tcx>(
 
     debug!(?concrete, "is_const_evaluatable");
     match concrete {
-        Err(ErrorHandled::TooGeneric) if !substs.has_infer_types_or_consts() => {
-            // FIXME(const_evaluatable_checked): We really should move
-            // emitting this error message to fulfill instead. For
-            // now this is easier.
-            //
-            // This is not a problem without `const_evaluatable_checked` as
-            // all `ConstEvaluatable` predicates have to be fulfilled for compilation
-            // to succeed.
-            //
-            // @lcnr: We already emit an error for things like
-            // `fn test<const N: usize>() -> [0 - N]` eagerly here,
-            // so until we fix this I don't really care.
-
-            let mut err = infcx
-                .tcx
-                .sess
-                .struct_span_err(span, "constant expression depends on a generic parameter");
-            // FIXME(const_generics): we should suggest to the user how they can resolve this
-            // issue. However, this is currently not actually possible
-            // (see https://github.com/rust-lang/rust/issues/66962#issuecomment-575907083).
-            //
-            // Note that with `feature(const_evaluatable_checked)` this case should not
-            // be reachable.
-            err.note("this may fail depending on what value the parameter takes");
-            err.emit();
-            Err(ErrorHandled::Reported(ErrorReported))
+        Err(ErrorHandled::TooGeneric) => Err(match substs.has_infer_types_or_consts() {
+            true => NotConstEvaluatable::MentionsInfer,
+            false => NotConstEvaluatable::MentionsParam,
+        }),
+        Err(ErrorHandled::Linted) => {
+            infcx.tcx.sess.delay_span_bug(span, "constant in type had error reported as lint");
+            Err(NotConstEvaluatable::Error(ErrorReported))
         }
-        c => c.map(drop),
+        Err(ErrorHandled::Reported(e)) => Err(NotConstEvaluatable::Error(e)),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -239,7 +217,9 @@ impl AbstractConst<'tcx> {
         ct: &ty::Const<'tcx>,
     ) -> Result<Option<AbstractConst<'tcx>>, ErrorReported> {
         match ct.val {
-            ty::ConstKind::Unevaluated(def, substs, None) => AbstractConst::new(tcx, def, substs),
+            ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted: _ }) => {
+                AbstractConst::new(tcx, def, substs)
+            }
             ty::ConstKind::Error(_) => Err(ErrorReported),
             _ => Ok(None),
         }
@@ -334,6 +314,9 @@ impl<'a, 'tcx> AbstractConstBuilder<'a, 'tcx> {
                 self.nodes[func].used = true;
                 nodes.iter().for_each(|&n| self.nodes[n].used = true);
             }
+            Node::Cast(_, operand, _) => {
+                self.nodes[operand].used = true;
+            }
         }
 
         // Nodes start as unused.
@@ -377,7 +360,10 @@ impl<'a, 'tcx> AbstractConstBuilder<'a, 'tcx> {
                 let local = self.place_to_local(span, p)?;
                 Ok(self.locals[local])
             }
-            mir::Operand::Constant(ct) => Ok(self.add_node(Node::Leaf(ct.literal), span)),
+            mir::Operand::Constant(ct) => match ct.literal {
+                mir::ConstantKind::Ty(ct) => Ok(self.add_node(Node::Leaf(ct), span)),
+                mir::ConstantKind::Val(..) => self.error(Some(span), "unsupported constant")?,
+            },
         }
     }
 
@@ -435,11 +421,19 @@ impl<'a, 'tcx> AbstractConstBuilder<'a, 'tcx> {
                         self.locals[local] = self.add_node(Node::UnaryOp(op, operand), span);
                         Ok(())
                     }
+                    Rvalue::Cast(cast_kind, ref operand, ty) => {
+                        let operand = self.operand_to_node(span, operand)?;
+                        self.locals[local] =
+                            self.add_node(Node::Cast(cast_kind, operand, ty), span);
+                        Ok(())
+                    }
                     _ => self.error(Some(span), "unsupported rvalue")?,
                 }
             }
             // These are not actually relevant for us here, so we can ignore them.
-            StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => Ok(()),
+            StatementKind::AscribeUserType(..)
+            | StatementKind::StorageLive(_)
+            | StatementKind::StorageDead(_) => Ok(()),
             _ => self.error(Some(stmt.source_info.span), "unsupported statement")?,
         }
     }
@@ -529,22 +523,25 @@ impl<'a, 'tcx> AbstractConstBuilder<'a, 'tcx> {
             if let Some(next) = self.build_terminator(block.terminator())? {
                 block = &self.body.basic_blocks()[next];
             } else {
-                assert_eq!(self.locals[mir::RETURN_PLACE], self.nodes.last().unwrap());
-                // `AbstractConst`s should not contain any promoteds as they require references which
-                // are not allowed.
-                assert!(!self.nodes.iter().any(|n| matches!(
-                    n.node,
-                    Node::Leaf(ty::Const { val: ty::ConstKind::Unevaluated(_, _, Some(_)), ty: _ })
-                )));
-
-                self.nodes[self.locals[mir::RETURN_PLACE]].used = true;
-                if let Some(&unused) = self.nodes.iter().find(|n| !n.used) {
-                    self.error(Some(unused.span), "dead code")?;
-                }
-
-                return Ok(self.tcx.arena.alloc_from_iter(self.nodes.into_iter().map(|n| n.node)));
+                break;
             }
         }
+
+        assert_eq!(self.locals[mir::RETURN_PLACE], self.nodes.last().unwrap());
+        for n in self.nodes.iter() {
+            if let Node::Leaf(ty::Const { val: ty::ConstKind::Unevaluated(ct), ty: _ }) = n.node {
+                // `AbstractConst`s should not contain any promoteds as they require references which
+                // are not allowed.
+                assert_eq!(ct.promoted, None);
+            }
+        }
+
+        self.nodes[self.locals[mir::RETURN_PLACE]].used = true;
+        if let Some(&unused) = self.nodes.iter().find(|n| !n.used) {
+            self.error(Some(unused.span), "dead code")?;
+        }
+
+        Ok(self.tcx.arena.alloc_from_iter(self.nodes.into_iter().map(|n| n.node)))
     }
 }
 
@@ -618,6 +615,7 @@ where
                 recurse(tcx, ct.subtree(func), f)?;
                 args.iter().try_for_each(|&arg| recurse(tcx, ct.subtree(arg), f))
             }
+            Node::Cast(_, operand, _) => recurse(tcx, ct.subtree(operand), f),
         }
     }
 
@@ -670,10 +668,16 @@ pub(super) fn try_unify<'tcx>(
                 // we do not want to use `assert_eq!(a(), b())` to infer that `N` and `M` have to be `1`. This
                 // means that we only allow inference variables if they are equal.
                 (ty::ConstKind::Infer(a_val), ty::ConstKind::Infer(b_val)) => a_val == b_val,
-                (
-                    ty::ConstKind::Unevaluated(a_def, a_substs, None),
-                    ty::ConstKind::Unevaluated(b_def, b_substs, None),
-                ) => a_def == b_def && a_substs == b_substs,
+                // We expand generic anonymous constants at the start of this function, so this
+                // branch should only be taking when dealing with associated constants, at
+                // which point directly comparing them seems like the desired behavior.
+                //
+                // FIXME(const_evaluatable_checked): This isn't actually the case.
+                // We also take this branch for concrete anonymous constants and
+                // expand generic anonymous constants with concrete substs.
+                (ty::ConstKind::Unevaluated(a_uv), ty::ConstKind::Unevaluated(b_uv)) => {
+                    a_uv == b_uv
+                }
                 // FIXME(const_evaluatable_checked): We may want to either actually try
                 // to evaluate `a_ct` and `b_ct` if they are are fully concrete or something like
                 // this, for now we just return false here.
@@ -691,10 +695,13 @@ pub(super) fn try_unify<'tcx>(
             if a_args.len() == b_args.len() =>
         {
             try_unify(tcx, a.subtree(a_f), b.subtree(b_f))
-                && a_args
-                    .iter()
-                    .zip(b_args)
+                && iter::zip(a_args, b_args)
                     .all(|(&an, &bn)| try_unify(tcx, a.subtree(an), b.subtree(bn)))
+        }
+        (Node::Cast(a_cast_kind, a_operand, a_ty), Node::Cast(b_cast_kind, b_operand, b_ty))
+            if (a_ty == b_ty) && (a_cast_kind == b_cast_kind) =>
+        {
+            try_unify(tcx, a.subtree(a_operand), b.subtree(b_operand))
         }
         _ => false,
     }

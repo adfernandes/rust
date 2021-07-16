@@ -29,6 +29,21 @@ struct C {
     i: Vec<i32>,
     j: i64,
 }
+
+#[derive(Default)]
+struct D {
+    a: Option<i32>,
+    b: Option<i32>,
+}
+
+macro_rules! m {
+    ($key:ident: $value:tt) => {{
+        let mut data = $crate::D::default();
+        data.$key = Some($value);
+        data
+    }};
+}
+
 /// Implements .next() that returns a different number each time.
 struct SideEffect(i32);
 
@@ -136,6 +151,18 @@ fn main() {
 
     // Don't lint in external macros
     field_reassign_with_default!();
+
+    // be sure suggestion is correct with generics
+    let mut a: Wrapper<bool> = Default::default();
+    a.i = true;
+
+    let mut a: WrapperMulti<i32, i64> = Default::default();
+    a.i = 42;
+
+    // Don't lint in macros
+    m! {
+        a: 42
+    };
 }
 
 mod m {
@@ -144,4 +171,15 @@ mod m {
         pub a: u64,
         b: u64,
     }
+}
+
+#[derive(Default)]
+struct Wrapper<T> {
+    i: T,
+}
+
+#[derive(Default)]
+struct WrapperMulti<T, U> {
+    i: T,
+    j: U,
 }

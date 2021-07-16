@@ -5,8 +5,8 @@ use crate::iter::{InPlaceIterable, SourceIter, TrustedLen};
 
 /// An iterator that iterates two other iterators simultaneously.
 ///
-/// This `struct` is created by [`Iterator::zip`]. See its documentation
-/// for more.
+/// This `struct` is created by [`zip`] or [`Iterator::zip`].
+/// See their documentation for more.
 #[derive(Clone)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -33,6 +33,37 @@ impl<A: Iterator, B: Iterator> Zip<A, B> {
     }
 }
 
+/// Converts the arguments to iterators and zips them.
+///
+/// See the documentation of [`Iterator::zip`] for more.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(iter_zip)]
+/// use std::iter::zip;
+///
+/// let xs = [1, 2, 3];
+/// let ys = [4, 5, 6];
+/// for (x, y) in zip(&xs, &ys) {
+///     println!("x:{}, y:{}", x, y);
+/// }
+///
+/// // Nested zips are also possible:
+/// let zs = [7, 8, 9];
+/// for ((x, y), z) in zip(zip(&xs, &ys), &zs) {
+///     println!("x:{}, y:{}, z:{}", x, y, z);
+/// }
+/// ```
+#[unstable(feature = "iter_zip", issue = "83574")]
+pub fn zip<A, B>(a: A, b: B) -> Zip<A::IntoIter, B::IntoIter>
+where
+    A: IntoIterator,
+    B: IntoIterator,
+{
+    ZipImpl::new(a.into_iter(), b.into_iter())
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<A, B> Iterator for Zip<A, B>
 where
@@ -57,6 +88,7 @@ where
     }
 
     #[inline]
+    #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> Self::Item
     where
         Self: TrustedRandomAccess,
@@ -195,6 +227,8 @@ where
     fn next(&mut self) -> Option<(A::Item, B::Item)> {
         if self.index < self.len {
             let i = self.index;
+            // since get_unchecked executes code which can panic we increment the counters beforehand
+            // so that the same index won't be accessed twice, as required by TrustedRandomAccess
             self.index += 1;
             // SAFETY: `i` is smaller than `self.len`, thus smaller than `self.a.len()` and `self.b.len()`
             unsafe {
@@ -202,6 +236,7 @@ where
             }
         } else if A::MAY_HAVE_SIDE_EFFECT && self.index < self.a_len {
             let i = self.index;
+            // as above, increment before executing code that may panic
             self.index += 1;
             self.len += 1;
             // match the base implementation's potential side effects
@@ -227,6 +262,8 @@ where
         let end = self.index + delta;
         while self.index < end {
             let i = self.index;
+            // since get_unchecked executes code which can panic we increment the counters beforehand
+            // so that the same index won't be accessed twice, as required by TrustedRandomAccess
             self.index += 1;
             if A::MAY_HAVE_SIDE_EFFECT {
                 // SAFETY: the usage of `cmp::min` to calculate `delta`
@@ -263,9 +300,12 @@ where
                 let sz_a = self.a.size();
                 if A::MAY_HAVE_SIDE_EFFECT && sz_a > self.len {
                     for _ in 0..sz_a - self.len {
+                        // since next_back() may panic we increment the counters beforehand
+                        // to keep Zip's state in sync with the underlying iterator source
+                        self.a_len -= 1;
                         self.a.next_back();
                     }
-                    self.a_len = self.len;
+                    debug_assert_eq!(self.a_len, self.len);
                 }
                 let sz_b = self.b.size();
                 if B::MAY_HAVE_SIDE_EFFECT && sz_b > self.len {
@@ -276,6 +316,8 @@ where
             }
         }
         if self.index < self.len {
+            // since get_unchecked executes code which can panic we increment the counters beforehand
+            // so that the same index won't be accessed twice, as required by TrustedRandomAccess
             self.len -= 1;
             self.a_len -= 1;
             let i = self.len;
@@ -403,7 +445,7 @@ impl<A: Debug + TrustedRandomAccess, B: Debug + TrustedRandomAccess> ZipFmt<A, B
 ///    called on `self`:
 ///     * `std::clone::Clone::clone()`
 ///     * `std::iter::Iterator::size_hint()`
-///     * `std::iter::Iterator::next_back()`
+///     * `std::iter::DoubleEndedIterator::next_back()`
 ///     * `std::iter::Iterator::__iterator_get_unchecked()`
 ///     * `std::iter::TrustedRandomAccess::size()`
 ///

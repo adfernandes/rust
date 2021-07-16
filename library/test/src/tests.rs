@@ -61,6 +61,8 @@ fn one_ignored_one_unignored_test() -> Vec<TestDescAndFn> {
                 ignore: true,
                 should_panic: ShouldPanic::No,
                 allow_fail: false,
+                compile_fail: false,
+                no_run: false,
                 test_type: TestType::Unknown,
             },
             testfn: DynTestFn(Box::new(move || {})),
@@ -71,6 +73,8 @@ fn one_ignored_one_unignored_test() -> Vec<TestDescAndFn> {
                 ignore: false,
                 should_panic: ShouldPanic::No,
                 allow_fail: false,
+                compile_fail: false,
+                no_run: false,
                 test_type: TestType::Unknown,
             },
             testfn: DynTestFn(Box::new(move || {})),
@@ -89,12 +93,14 @@ pub fn do_not_run_ignored_tests() {
             ignore: true,
             should_panic: ShouldPanic::No,
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(f)),
     };
     let (tx, rx) = channel();
-    run_test(&TestOpts::new(), false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&TestOpts::new(), false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let result = rx.recv().unwrap().result;
     assert_ne!(result, TrOk);
 }
@@ -108,12 +114,14 @@ pub fn ignored_tests_result_in_ignored() {
             ignore: true,
             should_panic: ShouldPanic::No,
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(f)),
     };
     let (tx, rx) = channel();
-    run_test(&TestOpts::new(), false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&TestOpts::new(), false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let result = rx.recv().unwrap().result;
     assert_eq!(result, TrIgnored);
 }
@@ -131,12 +139,14 @@ fn test_should_panic() {
             ignore: false,
             should_panic: ShouldPanic::Yes,
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(f)),
     };
     let (tx, rx) = channel();
-    run_test(&TestOpts::new(), false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&TestOpts::new(), false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let result = rx.recv().unwrap().result;
     assert_eq!(result, TrOk);
 }
@@ -154,12 +164,14 @@ fn test_should_panic_good_message() {
             ignore: false,
             should_panic: ShouldPanic::YesWithMessage("error message"),
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(f)),
     };
     let (tx, rx) = channel();
-    run_test(&TestOpts::new(), false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&TestOpts::new(), false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let result = rx.recv().unwrap().result;
     assert_eq!(result, TrOk);
 }
@@ -182,12 +194,14 @@ fn test_should_panic_bad_message() {
             ignore: false,
             should_panic: ShouldPanic::YesWithMessage(expected),
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(f)),
     };
     let (tx, rx) = channel();
-    run_test(&TestOpts::new(), false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&TestOpts::new(), false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let result = rx.recv().unwrap().result;
     assert_eq!(result, TrFailedMsg(failed_msg.to_string()));
 }
@@ -214,12 +228,14 @@ fn test_should_panic_non_string_message_type() {
             ignore: false,
             should_panic: ShouldPanic::YesWithMessage(expected),
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(f)),
     };
     let (tx, rx) = channel();
-    run_test(&TestOpts::new(), false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&TestOpts::new(), false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let result = rx.recv().unwrap().result;
     assert_eq!(result, TrFailedMsg(failed_msg));
 }
@@ -238,12 +254,22 @@ fn test_should_panic_but_succeeds() {
                 ignore: false,
                 should_panic,
                 allow_fail: false,
+                compile_fail: false,
+                no_run: false,
                 test_type: TestType::Unknown,
             },
             testfn: DynTestFn(Box::new(f)),
         };
         let (tx, rx) = channel();
-        run_test(&TestOpts::new(), false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+        run_test(
+            &TestOpts::new(),
+            false,
+            TestId(0),
+            desc,
+            RunStrategy::InProcess,
+            tx,
+            Concurrent::No,
+        );
         let result = rx.recv().unwrap().result;
         assert_eq!(
             result,
@@ -262,6 +288,8 @@ fn report_time_test_template(report_time: bool) -> Option<TestExecTime> {
             ignore: false,
             should_panic: ShouldPanic::No,
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(f)),
@@ -270,7 +298,7 @@ fn report_time_test_template(report_time: bool) -> Option<TestExecTime> {
 
     let test_opts = TestOpts { time_options, ..TestOpts::new() };
     let (tx, rx) = channel();
-    run_test(&test_opts, false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&test_opts, false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let exec_time = rx.recv().unwrap().exec_time;
     exec_time
 }
@@ -295,6 +323,8 @@ fn time_test_failure_template(test_type: TestType) -> TestResult {
             ignore: false,
             should_panic: ShouldPanic::No,
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type,
         },
         testfn: DynTestFn(Box::new(f)),
@@ -305,7 +335,7 @@ fn time_test_failure_template(test_type: TestType) -> TestResult {
 
     let test_opts = TestOpts { time_options: Some(time_options), ..TestOpts::new() };
     let (tx, rx) = channel();
-    run_test(&test_opts, false, desc, RunStrategy::InProcess, tx, Concurrent::No);
+    run_test(&test_opts, false, TestId(0), desc, RunStrategy::InProcess, tx, Concurrent::No);
     let result = rx.recv().unwrap().result;
 
     result
@@ -332,6 +362,8 @@ fn typed_test_desc(test_type: TestType) -> TestDesc {
         ignore: false,
         should_panic: ShouldPanic::No,
         allow_fail: false,
+        compile_fail: false,
+        no_run: false,
         test_type,
     }
 }
@@ -443,6 +475,8 @@ pub fn exclude_should_panic_option() {
             ignore: false,
             should_panic: ShouldPanic::Yes,
             allow_fail: false,
+            compile_fail: false,
+            no_run: false,
             test_type: TestType::Unknown,
         },
         testfn: DynTestFn(Box::new(move || {})),
@@ -465,6 +499,8 @@ pub fn exact_filter_match() {
                     ignore: false,
                     should_panic: ShouldPanic::No,
                     allow_fail: false,
+                    compile_fail: false,
+                    no_run: false,
                     test_type: TestType::Unknown,
                 },
                 testfn: DynTestFn(Box::new(move || {})),
@@ -557,6 +593,8 @@ pub fn sort_tests() {
                     ignore: false,
                     should_panic: ShouldPanic::No,
                     allow_fail: false,
+                    compile_fail: false,
+                    no_run: false,
                     test_type: TestType::Unknown,
                 },
                 testfn: DynTestFn(Box::new(testfn)),
@@ -634,10 +672,12 @@ pub fn test_bench_no_iter() {
         ignore: false,
         should_panic: ShouldPanic::No,
         allow_fail: false,
+        compile_fail: false,
+        no_run: false,
         test_type: TestType::Unknown,
     };
 
-    crate::bench::benchmark(desc, tx, true, f);
+    crate::bench::benchmark(TestId(0), desc, tx, true, f);
     rx.recv().unwrap();
 }
 
@@ -654,10 +694,12 @@ pub fn test_bench_iter() {
         ignore: false,
         should_panic: ShouldPanic::No,
         allow_fail: false,
+        compile_fail: false,
+        no_run: false,
         test_type: TestType::Unknown,
     };
 
-    crate::bench::benchmark(desc, tx, true, f);
+    crate::bench::benchmark(TestId(0), desc, tx, true, f);
     rx.recv().unwrap();
 }
 
@@ -668,6 +710,8 @@ fn should_sort_failures_before_printing_them() {
         ignore: false,
         should_panic: ShouldPanic::No,
         allow_fail: false,
+        compile_fail: false,
+        no_run: false,
         test_type: TestType::Unknown,
     };
 
@@ -676,6 +720,8 @@ fn should_sort_failures_before_printing_them() {
         ignore: false,
         should_panic: ShouldPanic::No,
         allow_fail: false,
+        compile_fail: false,
+        no_run: false,
         test_type: TestType::Unknown,
     };
 

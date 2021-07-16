@@ -26,9 +26,9 @@ pub fn target() -> Target {
          */
         data_layout: "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64".to_string(),
         options: TargetOptions {
+            abi: "eabi".to_string(),
             linker_flavor: LinkerFlavor::Ld,
             linker: Some("arm-none-eabi-ld".to_string()),
-            linker_is_gnu: true,
 
             // extra args passed to the external assembler (assuming `arm-none-eabi-as`):
             // * activate t32/a32 interworking
@@ -44,9 +44,6 @@ pub fn target() -> Target {
             features: "+soft-float,+strict-align".to_string(),
 
             main_needs_argc_argv: false,
-
-            // No thread-local storage (just use a static Cell)
-            has_elf_tls: false,
 
             // don't have atomic compare-and-swap
             atomic_cas: false,

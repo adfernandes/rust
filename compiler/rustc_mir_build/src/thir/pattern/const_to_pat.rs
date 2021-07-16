@@ -2,6 +2,7 @@ use rustc_hir as hir;
 use rustc_index::vec::Idx;
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_middle::mir::Field;
+use rustc_middle::thir::{FieldPat, Pat, PatKind};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, AdtDef, Ty, TyCtxt};
 use rustc_session::lint;
@@ -12,7 +13,7 @@ use rustc_trait_selection::traits::{self, ObligationCause, PredicateObligation};
 
 use std::cell::Cell;
 
-use super::{FieldPat, Pat, PatCtxt, PatKind};
+use super::PatCtxt;
 
 impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
     /// Converts an evaluated constant to a pattern (if possible).
@@ -246,6 +247,18 @@ impl<'a, 'tcx> ConstToPat<'a, 'tcx> {
             })
     }
 
+    fn field_pats(
+        &self,
+        vals: impl Iterator<Item = &'tcx ty::Const<'tcx>>,
+    ) -> Result<Vec<FieldPat<'tcx>>, FallbackToConstRef> {
+        vals.enumerate()
+            .map(|(idx, val)| {
+                let field = Field::new(idx);
+                Ok(FieldPat { field, pattern: self.recur(val, false)? })
+            })
+            .collect()
+    }
+
     // Recursive helper for `to_pat`; invoke that (instead of calling this directly).
     fn recur(
         &self,
@@ -257,24 +270,16 @@ impl<'a, 'tcx> ConstToPat<'a, 'tcx> {
         let tcx = self.tcx();
         let param_env = self.param_env;
 
-        let field_pats = |vals: &[&'tcx ty::Const<'tcx>]| -> Result<_, _> {
-            vals.iter()
-                .enumerate()
-                .map(|(idx, val)| {
-                    let field = Field::new(idx);
-                    Ok(FieldPat { field, pattern: self.recur(val, false)? })
-                })
-                .collect()
-        };
-
         let kind = match cv.ty.kind() {
             ty::Float(_) => {
-                tcx.struct_span_lint_hir(
-                    lint::builtin::ILLEGAL_FLOATING_POINT_LITERAL_PATTERN,
-                    id,
-                    span,
-                    |lint| lint.build("floating-point types cannot be used in patterns").emit(),
-                );
+                if self.include_lint_checks {
+                    tcx.struct_span_lint_hir(
+                        lint::builtin::ILLEGAL_FLOATING_POINT_LITERAL_PATTERN,
+                        id,
+                        span,
+                        |lint| lint.build("floating-point types cannot be used in patterns").emit(),
+                    );
+                }
                 PatKind::Constant { value: cv }
             }
             ty::Adt(adt_def, _) if adt_def.is_union() => {
@@ -361,12 +366,12 @@ impl<'a, 'tcx> ConstToPat<'a, 'tcx> {
                     variant_index: destructured
                         .variant
                         .expect("destructed const of adt without variant id"),
-                    subpatterns: field_pats(destructured.fields)?,
+                    subpatterns: self.field_pats(destructured.fields.iter().copied())?,
                 }
             }
             ty::Tuple(_) | ty::Adt(_, _) => {
                 let destructured = tcx.destructure_const(param_env.and(cv));
-                PatKind::Leaf { subpatterns: field_pats(destructured.fields)? }
+                PatKind::Leaf { subpatterns: self.field_pats(destructured.fields.iter().copied())? }
             }
             ty::Array(..) => PatKind::Array {
                 prefix: tcx
@@ -485,17 +490,29 @@ impl<'a, 'tcx> ConstToPat<'a, 'tcx> {
                 // convert the dereferenced constant to a pattern that is the sub-pattern of the
                 // deref pattern.
                 _ => {
-                    let old = self.behind_reference.replace(true);
-                    // In case there are structural-match violations somewhere in this subpattern,
-                    // we fall back to a const pattern. If we do not do this, we may end up with
-                    // a !structural-match constant that is not of reference type, which makes it
-                    // very hard to invoke `PartialEq::eq` on it as a fallback.
-                    let val = match self.recur(tcx.deref_const(self.param_env.and(cv)), false) {
-                        Ok(subpattern) => PatKind::Deref { subpattern },
-                        Err(_) => PatKind::Constant { value: cv },
-                    };
-                    self.behind_reference.set(old);
-                    val
+                    if !pointee_ty.is_sized(tcx.at(span), param_env) {
+                        // `tcx.deref_const()` below will ICE with an unsized type
+                        // (except slices, which are handled in a separate arm above).
+                        let msg = format!("cannot use unsized non-slice type `{}` in constant patterns", pointee_ty);
+                        if self.include_lint_checks {
+                            tcx.sess.span_err(span, &msg);
+                        } else {
+                            tcx.sess.delay_span_bug(span, &msg);
+                        }
+                        PatKind::Wild
+                    } else {
+                        let old = self.behind_reference.replace(true);
+                        // In case there are structural-match violations somewhere in this subpattern,
+                        // we fall back to a const pattern. If we do not do this, we may end up with
+                        // a !structural-match constant that is not of reference type, which makes it
+                        // very hard to invoke `PartialEq::eq` on it as a fallback.
+                        let val = match self.recur(tcx.deref_const(self.param_env.and(cv)), false) {
+                            Ok(subpattern) => PatKind::Deref { subpattern },
+                            Err(_) => PatKind::Constant { value: cv },
+                        };
+                        self.behind_reference.set(old);
+                        val
+                    }
                 }
             },
             ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::FnDef(..) => {

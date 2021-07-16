@@ -48,13 +48,40 @@ LL |     type C where Self: Copy = String;
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Copy` is not implemented for `T`
    |
    = note: required because of the requirements on the impl of `Copy` for `Fooy<T>`
-   = note: the requirement `Fooy<T>: Copy` appears on the associated impl type but not on the corresponding associated trait type
+note: the requirement `Fooy<T>: Copy` appears on the associated impl type `C` but not on the corresponding associated trait type
+  --> $DIR/impl_bounds.rs:7:5
+   |
+LL | trait Foo {
+   |       --- in this trait
+...
+LL |     type C where Self: Clone;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^ this trait associated type doesn't have the requirement `Fooy<T>: Copy`
 help: consider restricting type parameter `T`
    |
-LL | impl<T: Copy> Foo for Fooy<T> {
-   |       ^^^^^^
+LL | impl<T: std::marker::Copy> Foo for Fooy<T> {
+   |       ^^^^^^^^^^^^^^^^^^^
 
-error: aborting due to 4 previous errors
+error[E0277]: the trait bound `T: Copy` is not satisfied
+  --> $DIR/impl_bounds.rs:22:5
+   |
+LL |     fn d() where Self: Copy {}
+   |     ^^^^^^^^^^^^^^^^^^^^^^^ the trait `Copy` is not implemented for `T`
+   |
+   = note: required because of the requirements on the impl of `Copy` for `Fooy<T>`
+note: the requirement `Fooy<T>: Copy` appears on the impl method `d` but not on the corresponding trait method
+  --> $DIR/impl_bounds.rs:8:8
+   |
+LL | trait Foo {
+   |       --- in this trait
+...
+LL |     fn d() where Self: Clone;
+   |        ^ this trait method doesn't have the requirement `Fooy<T>: Copy`
+help: consider restricting type parameter `T`
+   |
+LL | impl<T: std::marker::Copy> Foo for Fooy<T> {
+   |       ^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 5 previous errors
 
 Some errors have detailed explanations: E0277, E0310, E0478.
 For more information about an error, try `rustc --explain E0277`.

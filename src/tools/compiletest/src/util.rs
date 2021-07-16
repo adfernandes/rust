@@ -48,6 +48,8 @@ const ARCH_TABLE: &[(&str, &str)] = &[
     ("armv7s", "arm"),
     ("asmjs", "asmjs"),
     ("avr", "avr"),
+    ("bpfeb", "bpf"),
+    ("bpfel", "bpf"),
     ("hexagon", "hexagon"),
     ("i386", "x86"),
     ("i586", "x86"),
@@ -127,6 +129,15 @@ const BIG_ENDIAN: &[&str] = &[
     "sparc64",
     "sparcv9",
 ];
+
+static ASM_SUPPORTED_ARCHS: &[&str] = &[
+    "x86", "x86_64", "arm", "aarch64", "riscv32", "riscv64", "nvptx64", "hexagon", "mips",
+    "mips64", "spirv", "wasm32",
+];
+
+pub fn has_asm_support(triple: &str) -> bool {
+    ASM_SUPPORTED_ARCHS.contains(&get_arch(triple))
+}
 
 pub fn matches_os(triple: &str, name: &str) -> bool {
     // For the wasm32 bare target we ignore anything also ignored on emscripten

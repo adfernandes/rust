@@ -1,8 +1,10 @@
-// no-system-llvm
+// min-llvm-version: 10.0.1
 // revisions: x86_64 i686
 // assembly-output: emit-asm
 //[x86_64] compile-flags: --target x86_64-unknown-linux-gnu
+//[x86_64] needs-llvm-components: x86
 //[i686] compile-flags: --target i686-unknown-linux-gnu
+//[i686] needs-llvm-components: x86
 // compile-flags: -C llvm-args=--x86-asm-syntax=intel
 // compile-flags: -C target-feature=+avx512bw
 
@@ -748,10 +750,11 @@ check_reg!(eax_f64 f64 "eax" "mov");
 // CHECK: #NO_APP
 check_reg!(eax_ptr ptr "eax" "mov");
 
-// CHECK-LABEL: ah_byte:
-// CHECK: #APP
-// CHECK: mov ah, ah
-// CHECK: #NO_APP
+// i686-LABEL: ah_byte:
+// i686: #APP
+// i686: mov ah, ah
+// i686: #NO_APP
+#[cfg(i686)]
 check_reg!(ah_byte i8 "ah" "mov");
 
 // CHECK-LABEL: xmm0_i32:

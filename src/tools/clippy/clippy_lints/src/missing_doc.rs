@@ -5,10 +5,9 @@
 // [`missing_doc`]: https://github.com/rust-lang/rust/blob/cf9cf7c923eb01146971429044f216a3ca905e06/compiler/rustc_lint/src/builtin.rs#L415
 //
 
-use crate::utils::span_lint;
-use if_chain::if_chain;
-use rustc_ast::ast::{self, MetaItem, MetaItemKind};
-use rustc_ast::attr;
+use clippy_utils::attrs::is_doc_hidden;
+use clippy_utils::diagnostics::span_lint;
+use rustc_ast::ast;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::ty;
@@ -56,20 +55,6 @@ impl MissingDoc {
         *self.doc_hidden_stack.last().expect("empty doc_hidden_stack")
     }
 
-    fn has_include(meta: Option<MetaItem>) -> bool {
-        if_chain! {
-            if let Some(meta) = meta;
-            if let MetaItemKind::List(list) = meta.kind;
-            if let Some(meta) = list.get(0);
-            if let Some(name) = meta.ident();
-            then {
-                name.name == sym::include
-            } else {
-                false
-            }
-        }
-    }
-
     fn check_missing_docs_attrs(
         &self,
         cx: &LateContext<'_>,
@@ -95,7 +80,7 @@ impl MissingDoc {
 
         let has_doc = attrs
             .iter()
-            .any(|a| a.is_doc_comment() || a.doc_str().is_some() || a.is_value_str() || Self::has_include(a.meta()));
+            .any(|a| a.doc_str().is_some());
         if !has_doc {
             span_lint(
                 cx,
@@ -111,14 +96,7 @@ impl_lint_pass!(MissingDoc => [MISSING_DOCS_IN_PRIVATE_ITEMS]);
 
 impl<'tcx> LateLintPass<'tcx> for MissingDoc {
     fn enter_lint_attrs(&mut self, _: &LateContext<'tcx>, attrs: &'tcx [ast::Attribute]) {
-        let doc_hidden = self.doc_hidden()
-            || attrs.iter().any(|attr| {
-                attr.has_name(sym::doc)
-                    && match attr.meta_item_list() {
-                        None => false,
-                        Some(l) => attr::list_contains_name(&l[..], sym::hidden),
-                    }
-            });
+        let doc_hidden = self.doc_hidden() || is_doc_hidden(attrs);
         self.doc_hidden_stack.push(doc_hidden);
     }
 
@@ -128,7 +106,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
 
     fn check_crate(&mut self, cx: &LateContext<'tcx>, krate: &'tcx hir::Crate<'_>) {
         let attrs = cx.tcx.hir().attrs(hir::CRATE_HIR_ID);
-        self.check_missing_docs_attrs(cx, attrs, krate.item.span, "the", "crate");
+        self.check_missing_docs_attrs(cx, attrs, krate.item.inner, "the", "crate");
     }
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, it: &'tcx hir::Item<'_>) {
@@ -188,7 +166,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
         self.check_missing_docs_attrs(cx, attrs, impl_item.span, article, desc);
     }
 
-    fn check_struct_field(&mut self, cx: &LateContext<'tcx>, sf: &'tcx hir::StructField<'_>) {
+    fn check_field_def(&mut self, cx: &LateContext<'tcx>, sf: &'tcx hir::FieldDef<'_>) {
         if !sf.is_positional() {
             let attrs = cx.tcx.hir().attrs(sf.hir_id);
             self.check_missing_docs_attrs(cx, attrs, sf.span, "a", "struct field");

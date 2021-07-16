@@ -1,23 +1,5 @@
-use core::array::{self, FixedSizeArray, IntoIter};
+use core::array;
 use core::convert::TryFrom;
-
-#[test]
-fn fixed_size_array() {
-    let mut array = [0; 64];
-    let mut zero_sized = [(); 64];
-    let mut empty_array = [0; 0];
-    let mut empty_zero_sized = [(); 0];
-
-    assert_eq!(FixedSizeArray::as_slice(&array).len(), 64);
-    assert_eq!(FixedSizeArray::as_slice(&zero_sized).len(), 64);
-    assert_eq!(FixedSizeArray::as_slice(&empty_array).len(), 0);
-    assert_eq!(FixedSizeArray::as_slice(&empty_zero_sized).len(), 0);
-
-    assert_eq!(FixedSizeArray::as_mut_slice(&mut array).len(), 64);
-    assert_eq!(FixedSizeArray::as_mut_slice(&mut zero_sized).len(), 64);
-    assert_eq!(FixedSizeArray::as_mut_slice(&mut empty_array).len(), 0);
-    assert_eq!(FixedSizeArray::as_mut_slice(&mut empty_zero_sized).len(), 0);
-}
 
 #[test]
 fn array_from_ref() {
@@ -59,14 +41,14 @@ fn array_try_from() {
 #[test]
 fn iterator_collect() {
     let arr = [0, 1, 2, 5, 9];
-    let v: Vec<_> = IntoIter::new(arr.clone()).collect();
+    let v: Vec<_> = IntoIterator::into_iter(arr.clone()).collect();
     assert_eq!(&arr[..], &v[..]);
 }
 
 #[test]
 fn iterator_rev_collect() {
     let arr = [0, 1, 2, 5, 9];
-    let v: Vec<_> = IntoIter::new(arr.clone()).rev().collect();
+    let v: Vec<_> = IntoIterator::into_iter(arr.clone()).rev().collect();
     assert_eq!(&v[..], &[9, 5, 2, 1, 0]);
 }
 
@@ -74,11 +56,11 @@ fn iterator_rev_collect() {
 fn iterator_nth() {
     let v = [0, 1, 2, 3, 4];
     for i in 0..v.len() {
-        assert_eq!(IntoIter::new(v.clone()).nth(i).unwrap(), v[i]);
+        assert_eq!(IntoIterator::into_iter(v.clone()).nth(i).unwrap(), v[i]);
     }
-    assert_eq!(IntoIter::new(v.clone()).nth(v.len()), None);
+    assert_eq!(IntoIterator::into_iter(v.clone()).nth(v.len()), None);
 
-    let mut iter = IntoIter::new(v);
+    let mut iter = IntoIterator::into_iter(v);
     assert_eq!(iter.nth(2).unwrap(), v[2]);
     assert_eq!(iter.nth(1).unwrap(), v[4]);
 }
@@ -86,17 +68,17 @@ fn iterator_nth() {
 #[test]
 fn iterator_last() {
     let v = [0, 1, 2, 3, 4];
-    assert_eq!(IntoIter::new(v).last().unwrap(), 4);
-    assert_eq!(IntoIter::new([0]).last().unwrap(), 0);
+    assert_eq!(IntoIterator::into_iter(v).last().unwrap(), 4);
+    assert_eq!(IntoIterator::into_iter([0]).last().unwrap(), 0);
 
-    let mut it = IntoIter::new([0, 9, 2, 4]);
+    let mut it = IntoIterator::into_iter([0, 9, 2, 4]);
     assert_eq!(it.next_back(), Some(4));
     assert_eq!(it.last(), Some(2));
 }
 
 #[test]
 fn iterator_clone() {
-    let mut it = IntoIter::new([0, 2, 4, 6, 8]);
+    let mut it = IntoIterator::into_iter([0, 2, 4, 6, 8]);
     assert_eq!(it.next(), Some(0));
     assert_eq!(it.next_back(), Some(8));
     let mut clone = it.clone();
@@ -110,7 +92,7 @@ fn iterator_clone() {
 
 #[test]
 fn iterator_fused() {
-    let mut it = IntoIter::new([0, 9, 2]);
+    let mut it = IntoIterator::into_iter([0, 9, 2]);
     assert_eq!(it.next(), Some(0));
     assert_eq!(it.next(), Some(9));
     assert_eq!(it.next(), Some(2));
@@ -123,7 +105,7 @@ fn iterator_fused() {
 
 #[test]
 fn iterator_len() {
-    let mut it = IntoIter::new([0, 1, 2, 5, 9]);
+    let mut it = IntoIterator::into_iter([0, 1, 2, 5, 9]);
     assert_eq!(it.size_hint(), (5, Some(5)));
     assert_eq!(it.len(), 5);
     assert_eq!(it.is_empty(), false);
@@ -139,7 +121,7 @@ fn iterator_len() {
     assert_eq!(it.is_empty(), false);
 
     // Empty
-    let it = IntoIter::new([] as [String; 0]);
+    let it = IntoIterator::into_iter([] as [String; 0]);
     assert_eq!(it.size_hint(), (0, Some(0)));
     assert_eq!(it.len(), 0);
     assert_eq!(it.is_empty(), true);
@@ -148,9 +130,9 @@ fn iterator_len() {
 #[test]
 fn iterator_count() {
     let v = [0, 1, 2, 3, 4];
-    assert_eq!(IntoIter::new(v.clone()).count(), 5);
+    assert_eq!(IntoIterator::into_iter(v.clone()).count(), 5);
 
-    let mut iter2 = IntoIter::new(v);
+    let mut iter2 = IntoIterator::into_iter(v);
     iter2.next();
     iter2.next();
     assert_eq!(iter2.count(), 3);
@@ -158,13 +140,13 @@ fn iterator_count() {
 
 #[test]
 fn iterator_flat_map() {
-    assert!((0..5).flat_map(|i| IntoIter::new([2 * i, 2 * i + 1])).eq(0..10));
+    assert!((0..5).flat_map(|i| IntoIterator::into_iter([2 * i, 2 * i + 1])).eq(0..10));
 }
 
 #[test]
 fn iterator_debug() {
     let arr = [0, 1, 2, 5, 9];
-    assert_eq!(format!("{:?}", IntoIter::new(arr)), "IntoIter([0, 1, 2, 5, 9])",);
+    assert_eq!(format!("{:?}", IntoIterator::into_iter(arr)), "IntoIter([0, 1, 2, 5, 9])",);
 }
 
 #[test]
@@ -194,14 +176,14 @@ fn iterator_drops() {
     // Simple: drop new iterator.
     let i = Cell::new(0);
     {
-        IntoIter::new(five(&i));
+        IntoIterator::into_iter(five(&i));
     }
     assert_eq!(i.get(), 5);
 
     // Call `next()` once.
     let i = Cell::new(0);
     {
-        let mut iter = IntoIter::new(five(&i));
+        let mut iter = IntoIterator::into_iter(five(&i));
         let _x = iter.next();
         assert_eq!(i.get(), 0);
         assert_eq!(iter.count(), 4);
@@ -212,7 +194,7 @@ fn iterator_drops() {
     // Check `clone` and calling `next`/`next_back`.
     let i = Cell::new(0);
     {
-        let mut iter = IntoIter::new(five(&i));
+        let mut iter = IntoIterator::into_iter(five(&i));
         iter.next();
         assert_eq!(i.get(), 1);
         iter.next_back();
@@ -235,7 +217,7 @@ fn iterator_drops() {
     // Check via `nth`.
     let i = Cell::new(0);
     {
-        let mut iter = IntoIter::new(five(&i));
+        let mut iter = IntoIterator::into_iter(five(&i));
         let _x = iter.nth(2);
         assert_eq!(i.get(), 2);
         let _y = iter.last();
@@ -245,13 +227,13 @@ fn iterator_drops() {
 
     // Check every element.
     let i = Cell::new(0);
-    for (index, _x) in IntoIter::new(five(&i)).enumerate() {
+    for (index, _x) in IntoIterator::into_iter(five(&i)).enumerate() {
         assert_eq!(i.get(), index);
     }
     assert_eq!(i.get(), 5);
 
     let i = Cell::new(0);
-    for (index, _x) in IntoIter::new(five(&i)).rev().enumerate() {
+    for (index, _x) in IntoIterator::into_iter(five(&i)).rev().enumerate() {
         assert_eq!(i.get(), index);
     }
     assert_eq!(i.get(), 5);

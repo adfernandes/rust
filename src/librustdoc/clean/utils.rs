@@ -1,12 +1,15 @@
 use crate::clean::auto_trait::AutoTraitFinder;
 use crate::clean::blanket_impl::BlanketImplFinder;
 use crate::clean::{
-    inline, Clean, Crate, ExternalCrate, Generic, GenericArg, GenericArgs, ImportSource, Item,
-    ItemKind, Lifetime, MacroKind, Path, PathSegment, Primitive, PrimitiveType, ResolvedPath, Type,
-    TypeBinding, TypeKind,
+    inline, Clean, Crate, Generic, GenericArg, GenericArgs, ImportSource, Item, ItemKind, Lifetime,
+    Path, PathSegment, PolyTrait, Primitive, PrimitiveType, ResolvedPath, Type, TypeBinding,
+    Visibility,
 };
 use crate::core::DocContext;
+use crate::formats::item_type::ItemType;
 
+use rustc_ast as ast;
+use rustc_ast::tokenstream::TokenTree;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
@@ -14,7 +17,11 @@ use rustc_middle::mir::interpret::ConstValue;
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::{self, DefIdTree, TyCtxt};
 use rustc_span::symbol::{kw, sym, Symbol};
+use std::fmt::Write as _;
 use std::mem;
+
+#[cfg(test)]
+mod tests;
 
 crate fn krate(cx: &mut DocContext<'_>) -> Crate {
     use crate::visit_lib::LibEmbargoVisitor;
@@ -27,7 +34,7 @@ crate fn krate(cx: &mut DocContext<'_>) -> Crate {
     cx.cache.owned_box_did = cx.tcx.lang_items().owned_box();
 
     let mut externs = Vec::new();
-    for &cnum in cx.tcx.crates().iter() {
+    for &cnum in cx.tcx.crates(()).iter() {
         externs.push((cnum, cnum.clean(cx)));
         // Analyze doc-reachability for extern items
         LibEmbargoVisitor::new(cx).visit_lib(cnum);
@@ -45,16 +52,20 @@ crate fn krate(cx: &mut DocContext<'_>) -> Crate {
                 // `#[doc(masked)]` to the injected `extern crate` because it's unstable.
                 if it.is_extern_crate()
                     && (it.attrs.has_doc_flag(sym::masked)
-                        || cx.tcx.is_compiler_builtins(it.def_id.krate))
+                        || cx.tcx.is_compiler_builtins(it.def_id.krate()))
                 {
-                    cx.cache.masked_crates.insert(it.def_id.krate);
+                    cx.cache.masked_crates.insert(it.def_id.krate());
                 }
             }
         }
         _ => unreachable!(),
     }
 
-    let ExternalCrate { name, src, primitives, keywords, .. } = LOCAL_CRATE.clean(cx);
+    let local_crate = LOCAL_CRATE.clean(cx);
+    let src = local_crate.src(cx.tcx);
+    let name = local_crate.name(cx.tcx);
+    let primitives = local_crate.primitives(cx.tcx);
+    let keywords = local_crate.keywords(cx.tcx);
     {
         let m = match *module.kind {
             ItemKind::ModuleItem(ref mut m) => m,
@@ -76,7 +87,7 @@ crate fn krate(cx: &mut DocContext<'_>) -> Crate {
     Crate {
         name,
         src,
-        module: Some(module),
+        module,
         externs,
         primitives,
         external_traits: cx.external_traits.clone(),
@@ -97,7 +108,7 @@ fn external_generic_args(
         .iter()
         .filter_map(|kind| match kind.unpack() {
             GenericArgKind::Lifetime(lt) => match lt {
-                ty::ReLateBound(_, ty::BoundRegion { kind: ty::BrAnon(_) }) => {
+                ty::ReLateBound(_, ty::BoundRegion { kind: ty::BrAnon(_), .. }) => {
                     Some(GenericArg::Lifetime(Lifetime::elided()))
                 }
                 _ => lt.clean(cx).map(GenericArg::Lifetime),
@@ -156,8 +167,18 @@ pub(super) fn external_path(
 
 crate fn strip_type(ty: Type) -> Type {
     match ty {
-        Type::ResolvedPath { path, param_names, did, is_generic } => {
-            Type::ResolvedPath { path: strip_path(&path), param_names, did, is_generic }
+        Type::ResolvedPath { path, did, is_generic } => {
+            Type::ResolvedPath { path: strip_path(&path), did, is_generic }
+        }
+        Type::DynTrait(mut bounds, lt) => {
+            let first = bounds.remove(0);
+            let stripped_trait = strip_type(first.trait_);
+
+            bounds.insert(
+                0,
+                PolyTrait { trait_: stripped_trait, generic_params: first.generic_params },
+            );
+            Type::DynTrait(bounds, lt)
         }
         Type::Tuple(inner_tys) => {
             Type::Tuple(inner_tys.iter().map(|t| strip_type(t.clone())).collect())
@@ -168,8 +189,9 @@ crate fn strip_type(ty: Type) -> Type {
         Type::BorrowedRef { lifetime, mutability, type_ } => {
             Type::BorrowedRef { lifetime, mutability, type_: Box::new(strip_type(*type_)) }
         }
-        Type::QPath { name, self_type, trait_ } => Type::QPath {
+        Type::QPath { name, self_type, trait_, self_def_id } => Type::QPath {
             name,
+            self_def_id,
             self_type: Box::new(strip_type(*self_type)),
             trait_: Box::new(strip_type(*trait_)),
         },
@@ -230,51 +252,20 @@ crate fn build_deref_target_impls(cx: &mut DocContext<'_>, items: &[Item], ret: 
     }
 }
 
-crate trait ToSource {
-    fn to_src(&self, cx: &DocContext<'_>) -> String;
-}
-
-impl ToSource for rustc_span::Span {
-    fn to_src(&self, cx: &DocContext<'_>) -> String {
-        debug!("converting span {:?} to snippet", self);
-        let sn = match cx.sess().source_map().span_to_snippet(*self) {
-            Ok(x) => x,
-            Err(_) => String::new(),
-        };
-        debug!("got snippet {}", sn);
-        sn
-    }
-}
-
 crate fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
     use rustc_hir::*;
     debug!("trying to get a name from pattern: {:?}", p);
 
     Symbol::intern(&match p.kind {
-        PatKind::Wild => return kw::Underscore,
+        PatKind::Wild | PatKind::Struct(..) => return kw::Underscore,
         PatKind::Binding(_, _, ident, _) => return ident.name,
         PatKind::TupleStruct(ref p, ..) | PatKind::Path(ref p) => qpath_to_string(p),
-        PatKind::Struct(ref name, ref fields, etc) => format!(
-            "{} {{ {}{} }}",
-            qpath_to_string(name),
-            fields
-                .iter()
-                .map(|fp| format!("{}: {}", fp.ident, name_from_pat(&fp.pat)))
-                .collect::<Vec<String>>()
-                .join(", "),
-            if etc { ", .." } else { "" }
-        ),
-        PatKind::Or(ref pats) => pats
-            .iter()
-            .map(|p| name_from_pat(&**p).to_string())
-            .collect::<Vec<String>>()
-            .join(" | "),
+        PatKind::Or(ref pats) => {
+            pats.iter().map(|p| name_from_pat(p).to_string()).collect::<Vec<String>>().join(" | ")
+        }
         PatKind::Tuple(ref elts, _) => format!(
             "({})",
-            elts.iter()
-                .map(|p| name_from_pat(&**p).to_string())
-                .collect::<Vec<String>>()
-                .join(", ")
+            elts.iter().map(|p| name_from_pat(p).to_string()).collect::<Vec<String>>().join(", ")
         ),
         PatKind::Box(ref p) => return name_from_pat(&**p),
         PatKind::Ref(ref p, _) => return name_from_pat(&**p),
@@ -286,9 +277,9 @@ crate fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
         }
         PatKind::Range(..) => return kw::Underscore,
         PatKind::Slice(ref begin, ref mid, ref end) => {
-            let begin = begin.iter().map(|p| name_from_pat(&**p).to_string());
+            let begin = begin.iter().map(|p| name_from_pat(p).to_string());
             let mid = mid.as_ref().map(|p| format!("..{}", name_from_pat(&**p))).into_iter();
-            let end = end.iter().map(|p| name_from_pat(&**p).to_string());
+            let end = end.iter().map(|p| name_from_pat(p).to_string());
             format!("[{}]", begin.chain(mid).chain(end).collect::<Vec<_>>().join(", "))
         }
     })
@@ -296,12 +287,12 @@ crate fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
 
 crate fn print_const(cx: &DocContext<'_>, n: &'tcx ty::Const<'_>) -> String {
     match n.val {
-        ty::ConstKind::Unevaluated(def, _, promoted) => {
+        ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs: _, promoted }) => {
             let mut s = if let Some(def) = def.as_local() {
                 let hir_id = cx.tcx.hir().local_def_id_to_hir_id(def.did);
                 print_const_expr(cx.tcx, cx.tcx.hir().body_owned_by(hir_id))
             } else {
-                inline::print_inlined_const(cx, def.did)
+                inline::print_inlined_const(cx.tcx, def.did)
             };
             if let Some(promoted) = promoted {
                 s.push_str(&format!("::{:?}", promoted))
@@ -324,15 +315,15 @@ crate fn print_const(cx: &DocContext<'_>, n: &'tcx ty::Const<'_>) -> String {
     }
 }
 
-crate fn print_evaluated_const(cx: &DocContext<'_>, def_id: DefId) -> Option<String> {
-    cx.tcx.const_eval_poly(def_id).ok().and_then(|val| {
-        let ty = cx.tcx.type_of(def_id);
+crate fn print_evaluated_const(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    tcx.const_eval_poly(def_id).ok().and_then(|val| {
+        let ty = tcx.type_of(def_id);
         match (val, ty.kind()) {
             (_, &ty::Ref(..)) => None,
             (ConstValue::Scalar(_), &ty::Adt(_, _)) => None,
             (ConstValue::Scalar(_), _) => {
-                let const_ = ty::Const::from_value(cx.tcx, val, ty);
-                Some(print_const_with_custom_print_scalar(cx, const_))
+                let const_ = ty::Const::from_value(tcx, val, ty);
+                Some(print_const_with_custom_print_scalar(tcx, const_))
             }
             _ => None,
         }
@@ -341,15 +332,31 @@ crate fn print_evaluated_const(cx: &DocContext<'_>, def_id: DefId) -> Option<Str
 
 fn format_integer_with_underscore_sep(num: &str) -> String {
     let num_chars: Vec<_> = num.chars().collect();
-    let num_start_index = if num_chars.get(0) == Some(&'-') { 1 } else { 0 };
+    let mut num_start_index = if num_chars.get(0) == Some(&'-') { 1 } else { 0 };
+    let chunk_size = match num[num_start_index..].as_bytes() {
+        [b'0', b'b' | b'x', ..] => {
+            num_start_index += 2;
+            4
+        }
+        [b'0', b'o', ..] => {
+            num_start_index += 2;
+            let remaining_chars = num_chars.len() - num_start_index;
+            if remaining_chars <= 6 {
+                // don't add underscores to Unix permissions like 0755 or 100755
+                return num.to_string();
+            }
+            3
+        }
+        _ => 3,
+    };
 
     num_chars[..num_start_index]
         .iter()
-        .chain(num_chars[num_start_index..].rchunks(3).rev().intersperse(&['_']).flatten())
+        .chain(num_chars[num_start_index..].rchunks(chunk_size).rev().intersperse(&['_']).flatten())
         .collect()
 }
 
-fn print_const_with_custom_print_scalar(cx: &DocContext<'_>, ct: &'tcx ty::Const<'tcx>) -> String {
+fn print_const_with_custom_print_scalar(tcx: TyCtxt<'_>, ct: &'tcx ty::Const<'tcx>) -> String {
     // Use a slightly different format for integer types which always shows the actual value.
     // For all other types, fallback to the original `pretty_print_const`.
     match (ct.val, ct.ty.kind()) {
@@ -357,8 +364,8 @@ fn print_const_with_custom_print_scalar(cx: &DocContext<'_>, ct: &'tcx ty::Const
             format!("{}{}", format_integer_with_underscore_sep(&int.to_string()), ui.name_str())
         }
         (ty::ConstKind::Value(ConstValue::Scalar(int)), ty::Int(i)) => {
-            let ty = cx.tcx.lift(ct.ty).unwrap();
-            let size = cx.tcx.layout_of(ty::ParamEnv::empty().and(ty)).unwrap().size;
+            let ty = tcx.lift(ct.ty).unwrap();
+            let size = tcx.layout_of(ty::ParamEnv::empty().and(ty)).unwrap().size;
             let data = int.assert_bits(size);
             let sign_extended_data = size.sign_extend(data) as i128;
 
@@ -372,8 +379,8 @@ fn print_const_with_custom_print_scalar(cx: &DocContext<'_>, ct: &'tcx ty::Const
     }
 }
 
-crate fn is_literal_expr(cx: &DocContext<'_>, hir_id: hir::HirId) -> bool {
-    if let hir::Node::Expr(expr) = cx.tcx.hir().get(hir_id) {
+crate fn is_literal_expr(tcx: TyCtxt<'_>, hir_id: hir::HirId) -> bool {
+    if let hir::Node::Expr(expr) = tcx.hir().get(hir_id) {
         if let hir::ExprKind::Lit(_) = &expr.kind {
             return true;
         }
@@ -411,13 +418,13 @@ crate fn resolve_type(cx: &mut DocContext<'_>, path: Path, id: hir::HirId) -> Ty
             return Generic(kw::SelfUpper);
         }
         Res::Def(DefKind::TyParam, _) if path.segments.len() == 1 => {
-            return Generic(Symbol::intern(&format!("{:#}", path.print(&cx.cache))));
+            return Generic(Symbol::intern(&path.whole_name()));
         }
         Res::SelfTy(..) | Res::Def(DefKind::TyParam | DefKind::AssocTy, _) => true,
         _ => false,
     };
     let did = register_res(cx, path.res);
-    ResolvedPath { path, param_names: None, did, is_generic }
+    ResolvedPath { path, did, is_generic }
 }
 
 crate fn get_auto_trait_and_blanket_impls(
@@ -437,41 +444,54 @@ crate fn get_auto_trait_and_blanket_impls(
     auto_impls.into_iter().chain(blanket_impls)
 }
 
+/// If `res` has a documentation page associated, store it in the cache.
+///
+/// This is later used by [`href()`] to determine the HTML link for the item.
+///
+/// [`href()`]: crate::html::format::href
 crate fn register_res(cx: &mut DocContext<'_>, res: Res) -> DefId {
+    use DefKind::*;
     debug!("register_res({:?})", res);
 
     let (did, kind) = match res {
-        Res::Def(DefKind::Fn, i) => (i, TypeKind::Function),
-        Res::Def(DefKind::TyAlias, i) => (i, TypeKind::Typedef),
-        Res::Def(DefKind::Enum, i) => (i, TypeKind::Enum),
-        Res::Def(DefKind::Trait, i) => (i, TypeKind::Trait),
         Res::Def(DefKind::AssocTy | DefKind::AssocFn | DefKind::AssocConst, i) => {
-            (cx.tcx.parent(i).unwrap(), TypeKind::Trait)
+            // associated items are documented, but on the page of their parent
+            (cx.tcx.parent(i).unwrap(), ItemType::Trait)
         }
-        Res::Def(DefKind::Struct, i) => (i, TypeKind::Struct),
-        Res::Def(DefKind::Union, i) => (i, TypeKind::Union),
-        Res::Def(DefKind::Mod, i) => (i, TypeKind::Module),
-        Res::Def(DefKind::ForeignTy, i) => (i, TypeKind::Foreign),
-        Res::Def(DefKind::Const, i) => (i, TypeKind::Const),
-        Res::Def(DefKind::Static, i) => (i, TypeKind::Static),
         Res::Def(DefKind::Variant, i) => {
-            (cx.tcx.parent(i).expect("cannot get parent def id"), TypeKind::Enum)
+            // variant items are documented, but on the page of their parent
+            (cx.tcx.parent(i).expect("cannot get parent def id"), ItemType::Enum)
         }
-        Res::Def(DefKind::Macro(mac_kind), i) => match mac_kind {
-            MacroKind::Bang => (i, TypeKind::Macro),
-            MacroKind::Attr => (i, TypeKind::Attr),
-            MacroKind::Derive => (i, TypeKind::Derive),
-        },
-        Res::Def(DefKind::TraitAlias, i) => (i, TypeKind::TraitAlias),
-        Res::SelfTy(Some(def_id), _) => (def_id, TypeKind::Trait),
-        Res::SelfTy(_, Some((impl_def_id, _))) => return impl_def_id,
-        _ => return res.def_id(),
+        // Each of these have their own page.
+        Res::Def(
+            kind
+            @
+            (Fn | TyAlias | Enum | Trait | Struct | Union | Mod | ForeignTy | Const | Static
+            | Macro(..) | TraitAlias),
+            i,
+        ) => (i, kind.into()),
+        // This is part of a trait definition; document the trait.
+        Res::SelfTy(Some(trait_def_id), _) => (trait_def_id, ItemType::Trait),
+        // This is an inherent impl; it doesn't have its own page.
+        Res::SelfTy(None, Some((impl_def_id, _))) => return impl_def_id,
+        Res::SelfTy(None, None)
+        | Res::PrimTy(_)
+        | Res::ToolMod
+        | Res::SelfCtor(_)
+        | Res::Local(_)
+        | Res::NonMacroAttr(_)
+        | Res::Err => return res.def_id(),
+        Res::Def(
+            TyParam | ConstParam | Ctor(..) | ExternCrate | Use | ForeignMod | AnonConst | OpaqueTy
+            | Field | LifetimeParam | GlobalAsm | Impl | Closure | Generator,
+            id,
+        ) => return id,
     };
     if did.is_local() {
         return did;
     }
     inline::record_extern_fqn(cx, did, kind);
-    if let TypeKind::Trait = kind {
+    if let ItemType::Trait = kind {
         inline::record_extern_trait(cx, did);
     }
     did
@@ -496,8 +516,6 @@ where
 }
 
 /// Find the nearest parent module of a [`DefId`].
-///
-/// **Panics if the item it belongs to [is fake][Item::is_fake].**
 crate fn find_nearest_parent_module(tcx: TyCtxt<'_>, def_id: DefId) -> Option<DefId> {
     if def_id.is_top_level_module() {
         // The crate root has no parent. Use it as the root instead.
@@ -530,4 +548,63 @@ crate fn has_doc_flag(attrs: ty::Attributes<'_>, flag: Symbol) -> bool {
         attr.has_name(sym::doc)
             && attr.meta_item_list().map_or(false, |l| rustc_attr::list_contains_name(&l, flag))
     })
+}
+
+/// A link to `doc.rust-lang.org` that includes the channel name. Use this instead of manual links
+/// so that the channel is consistent.
+///
+/// Set by `bootstrap::Builder::doc_rust_lang_org_channel` in order to keep tests passing on beta/stable.
+crate const DOC_RUST_LANG_ORG_CHANNEL: &'static str = env!("DOC_RUST_LANG_ORG_CHANNEL");
+
+/// Render a sequence of macro arms in a format suitable for displaying to the user
+/// as part of an item declaration.
+pub(super) fn render_macro_arms<'a>(
+    matchers: impl Iterator<Item = &'a TokenTree>,
+    arm_delim: &str,
+) -> String {
+    let mut out = String::new();
+    for matcher in matchers {
+        writeln!(out, "    {} => {{ ... }}{}", render_macro_matcher(matcher), arm_delim).unwrap();
+    }
+    out
+}
+
+/// Render a macro matcher in a format suitable for displaying to the user
+/// as part of an item declaration.
+pub(super) fn render_macro_matcher(matcher: &TokenTree) -> String {
+    rustc_ast_pretty::pprust::tt_to_string(matcher)
+}
+
+pub(super) fn display_macro_source(
+    cx: &mut DocContext<'_>,
+    name: Symbol,
+    def: &ast::MacroDef,
+    def_id: DefId,
+    vis: impl Clean<Visibility>,
+) -> String {
+    let tts: Vec<_> = def.body.inner_tokens().into_trees().collect();
+    // Extract the spans of all matchers. They represent the "interface" of the macro.
+    let matchers = tts.chunks(4).map(|arm| &arm[0]);
+
+    if def.macro_rules {
+        format!("macro_rules! {} {{\n{}}}", name, render_macro_arms(matchers, ";"))
+    } else {
+        let vis = vis.clean(cx);
+
+        if matchers.len() <= 1 {
+            format!(
+                "{}macro {}{} {{\n    ...\n}}",
+                vis.to_src_with_space(cx.tcx, def_id),
+                name,
+                matchers.map(render_macro_matcher).collect::<String>(),
+            )
+        } else {
+            format!(
+                "{}macro {} {{\n{}}}",
+                vis.to_src_with_space(cx.tcx, def_id),
+                name,
+                render_macro_arms(matchers, ","),
+            )
+        }
+    }
 }

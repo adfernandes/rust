@@ -161,6 +161,36 @@ fn test_join_for_different_lengths_with_long_separator() {
 }
 
 #[test]
+fn test_join_isue_80335() {
+    use core::{borrow::Borrow, cell::Cell};
+
+    struct WeirdBorrow {
+        state: Cell<bool>,
+    }
+
+    impl Default for WeirdBorrow {
+        fn default() -> Self {
+            WeirdBorrow { state: Cell::new(false) }
+        }
+    }
+
+    impl Borrow<str> for WeirdBorrow {
+        fn borrow(&self) -> &str {
+            let state = self.state.get();
+            if state {
+                "0"
+            } else {
+                self.state.set(true);
+                "123456"
+            }
+        }
+    }
+
+    let arr: [WeirdBorrow; 3] = Default::default();
+    test_join!("0-0-0", arr, "-");
+}
+
+#[test]
 #[cfg_attr(miri, ignore)] // Miri is too slow
 fn test_unsafe_slice() {
     assert_eq!("ab", unsafe { "abc".get_unchecked(0..2) });
@@ -504,7 +534,7 @@ mod slice_index {
     #[test]
     #[should_panic]
     fn test_slice_fail() {
-        &"中华Việt Nam"[0..2];
+        let _ = &"中华Việt Nam"[0..2];
     }
 
     panic_cases! {
@@ -684,13 +714,13 @@ mod slice_index {
     #[test]
     #[should_panic(expected = "byte index 1024 is out of bounds of `Lorem ipsum dolor sit amet")]
     fn test_slice_fail_truncated_1() {
-        &LOREM_PARAGRAPH[..1024];
+        let _ = &LOREM_PARAGRAPH[..1024];
     }
     // check the truncation in the panic message
     #[test]
     #[should_panic(expected = "luctus, im`[...]")]
     fn test_slice_fail_truncated_2() {
-        &LOREM_PARAGRAPH[..1024];
+        let _ = &LOREM_PARAGRAPH[..1024];
     }
 }
 
@@ -705,7 +735,7 @@ fn test_str_slice_rangetoinclusive_ok() {
 #[should_panic]
 fn test_str_slice_rangetoinclusive_notok() {
     let s = "abcαβγ";
-    &s[..=3];
+    let _ = &s[..=3];
 }
 
 #[test]
@@ -721,7 +751,7 @@ fn test_str_slicemut_rangetoinclusive_ok() {
 fn test_str_slicemut_rangetoinclusive_notok() {
     let mut s = "abcαβγ".to_owned();
     let s: &mut str = &mut s;
-    &mut s[..=3];
+    let _ = &mut s[..=3];
 }
 
 #[test]

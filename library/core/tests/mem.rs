@@ -98,25 +98,6 @@ fn test_transmute_copy() {
 }
 
 #[test]
-fn test_transmute() {
-    trait Foo {
-        fn dummy(&self) {}
-    }
-    impl Foo for isize {}
-
-    let a = box 100isize as Box<dyn Foo>;
-    unsafe {
-        let x: ::core::raw::TraitObject = transmute(a);
-        assert!(*(x.data as *const isize) == 100);
-        let _x: Box<dyn Foo> = transmute(x);
-    }
-
-    unsafe {
-        assert_eq!(transmute::<_, Vec<u8>>("L".to_string()), [76]);
-    }
-}
-
-#[test]
 #[allow(dead_code)]
 fn test_discriminant_send_sync() {
     enum Regular {

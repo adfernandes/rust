@@ -973,6 +973,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         };
         if let (Some(a_sig), Some(b_sig)) = (a_sig, b_sig) {
+            // Intrinsics are not coercible to function pointers.
+            if a_sig.abi() == Abi::RustIntrinsic
+                || a_sig.abi() == Abi::PlatformIntrinsic
+                || b_sig.abi() == Abi::RustIntrinsic
+                || b_sig.abi() == Abi::PlatformIntrinsic
+            {
+                return Err(TypeError::IntrinsicCast);
+            }
             // The signature must match.
             let a_sig = self.normalize_associated_types_in(new.span, a_sig);
             let b_sig = self.normalize_associated_types_in(new.span, b_sig);
@@ -1440,20 +1448,23 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
         // as prior return coercions would not be relevant (#57664).
         let parent_id = fcx.tcx.hir().get_parent_node(id);
         let fn_decl = if let Some((expr, blk_id)) = expression {
-            pointing_at_return_type = fcx.suggest_mismatched_types_on_tail(
-                &mut err, expr, expected, found, cause.span, blk_id,
-            );
+            pointing_at_return_type =
+                fcx.suggest_mismatched_types_on_tail(&mut err, expr, expected, found, blk_id);
             let parent = fcx.tcx.hir().get(parent_id);
             if let (Some(cond_expr), true, false) = (
                 fcx.tcx.hir().get_if_cause(expr.hir_id),
                 expected.is_unit(),
                 pointing_at_return_type,
             ) {
-                // If the block is from an external macro, then do not suggest
-                // adding a semicolon, because there's nowhere to put it.
-                // See issue #81943.
+                // If the block is from an external macro or try (`?`) desugaring, then
+                // do not suggest adding a semicolon, because there's nowhere to put it.
+                // See issues #81943 and #87051.
                 if cond_expr.span.desugaring_kind().is_none()
                     && !in_external_macro(fcx.tcx.sess, cond_expr.span)
+                    && !matches!(
+                        cond_expr.kind,
+                        hir::ExprKind::Match(.., hir::MatchSource::TryDesugar)
+                    )
                 {
                     err.span_label(cond_expr.span, "expected this to be `()`");
                     if expr.can_have_side_effects() {
@@ -1474,6 +1485,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                     expected,
                     found,
                     can_suggest,
+                    fcx.tcx.hir().get_parent_item(id),
                 );
             }
             if !pointing_at_return_type {
@@ -1487,34 +1499,14 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
         if let (Some((expr, _)), Some((fn_decl, _, _))) =
             (expression, fcx.get_node_fn_decl(parent_item))
         {
-            fcx.suggest_missing_return_expr(&mut err, expr, fn_decl, expected, found);
+            fcx.suggest_missing_break_or_return_expr(
+                &mut err, expr, fn_decl, expected, found, id, parent_id,
+            );
         }
 
         if let (Some(sp), Some(fn_output)) = (fcx.ret_coercion_span.get(), fn_output) {
             self.add_impl_trait_explanation(&mut err, cause, fcx, expected, sp, fn_output);
         }
-
-        if let Some(sp) = fcx.ret_coercion_span.get() {
-            // If the closure has an explicit return type annotation,
-            // then a type error may occur at the first return expression we
-            // see in the closure (if it conflicts with the declared
-            // return type). Skip adding a note in this case, since it
-            // would be incorrect.
-            if !err.span.primary_spans().iter().any(|&span| span == sp) {
-                let hir = fcx.tcx.hir();
-                let body_owner = hir.body_owned_by(hir.enclosing_body_owner(fcx.body_id));
-                if fcx.tcx.is_closure(hir.body_owner_def_id(body_owner).to_def_id()) {
-                    err.span_note(
-                        sp,
-                        &format!(
-                            "return type inferred to be `{}` here",
-                            fcx.resolve_vars_if_possible(expected)
-                        ),
-                    );
-                }
-            }
-        }
-
         err
     }
 
@@ -1554,7 +1546,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
         if let hir::FnRetTy::Return(ty) = fn_output {
             // Get the return type.
             if let hir::TyKind::OpaqueDef(..) = ty.kind {
-                let ty = AstConv::ast_ty_to_ty(fcx, ty);
+                let ty = <dyn AstConv<'_>>::ast_ty_to_ty(fcx, ty);
                 // Get the `impl Trait`'s `DefId`.
                 if let ty::Opaque(def_id, _) = ty.kind() {
                     let hir_id = fcx.tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
@@ -1616,7 +1608,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
     fn is_return_ty_unsized(&self, fcx: &FnCtxt<'a, 'tcx>, blk_id: hir::HirId) -> bool {
         if let Some((fn_decl, _)) = fcx.get_fn_decl(blk_id) {
             if let hir::FnRetTy::Return(ty) = fn_decl.output {
-                let ty = AstConv::ast_ty_to_ty(fcx, ty);
+                let ty = <dyn AstConv<'_>>::ast_ty_to_ty(fcx, ty);
                 if let ty::Dynamic(..) = ty.kind() {
                     return true;
                 }

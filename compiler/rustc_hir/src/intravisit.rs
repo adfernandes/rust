@@ -98,7 +98,7 @@ where
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum FnKind<'a> {
     /// `#[xxx] pub async/const/extern "Abi" fn foo()`
     ItemFn(Ident, &'a Generics<'a>, FnHeader, &'a Visibility<'a>),
@@ -366,6 +366,9 @@ pub trait Visitor<'v>: Sized {
     fn visit_generic_param(&mut self, p: &'v GenericParam<'v>) {
         walk_generic_param(self, p)
     }
+    fn visit_const_param_default(&mut self, _param: HirId, ct: &'v AnonConst) {
+        walk_const_param_default(self, ct)
+    }
     fn visit_generics(&mut self, g: &'v Generics<'v>) {
         walk_generics(self, g)
     }
@@ -415,8 +418,8 @@ pub trait Visitor<'v>: Sized {
     ) {
         walk_struct_def(self, s)
     }
-    fn visit_struct_field(&mut self, s: &'v StructField<'v>) {
-        walk_struct_field(self, s)
+    fn visit_field_def(&mut self, s: &'v FieldDef<'v>) {
+        walk_field_def(self, s)
     }
     fn visit_enum_def(
         &mut self,
@@ -475,7 +478,7 @@ pub trait Visitor<'v>: Sized {
 
 /// Walks the contents of a crate. See also `Crate::visit_all_items`.
 pub fn walk_crate<'v, V: Visitor<'v>>(visitor: &mut V, krate: &'v Crate<'v>) {
-    visitor.visit_mod(&krate.item.module, krate.item.span, CRATE_HIR_ID);
+    visitor.visit_mod(&krate.item, krate.item.inner, CRATE_HIR_ID);
     walk_list!(visitor, visit_macro_def, krate.exported_macros);
     for (&id, attrs) in krate.attrs.iter() {
         for a in *attrs {
@@ -586,8 +589,9 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) {
             visitor.visit_id(item.hir_id());
             walk_list!(visitor, visit_foreign_item_ref, items);
         }
-        ItemKind::GlobalAsm(_) => {
+        ItemKind::GlobalAsm(asm) => {
             visitor.visit_id(item.hir_id());
+            walk_inline_asm(visitor, asm);
         }
         ItemKind::TyAlias(ref ty, ref generics) => {
             visitor.visit_id(item.hir_id());
@@ -643,6 +647,28 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) {
             visitor.visit_id(item.hir_id());
             visitor.visit_generics(generics);
             walk_list!(visitor, visit_param_bound, bounds);
+        }
+    }
+}
+
+fn walk_inline_asm<'v, V: Visitor<'v>>(visitor: &mut V, asm: &'v InlineAsm<'v>) {
+    for (op, _op_sp) in asm.operands {
+        match op {
+            InlineAsmOperand::In { expr, .. }
+            | InlineAsmOperand::InOut { expr, .. }
+            | InlineAsmOperand::Sym { expr, .. } => visitor.visit_expr(expr),
+            InlineAsmOperand::Out { expr, .. } => {
+                if let Some(expr) = expr {
+                    visitor.visit_expr(expr);
+                }
+            }
+            InlineAsmOperand::SplitInOut { in_expr, out_expr, .. } => {
+                visitor.visit_expr(in_expr);
+                if let Some(out_expr) = out_expr {
+                    visitor.visit_expr(out_expr);
+                }
+            }
+            InlineAsmOperand::Const { anon_const } => visitor.visit_anon_const(anon_const),
         }
     }
 }
@@ -709,7 +735,7 @@ pub fn walk_ty<'v, V: Visitor<'v>>(visitor: &mut V, typ: &'v Ty<'v>) {
             visitor.visit_ty(ty);
             visitor.visit_anon_const(length)
         }
-        TyKind::TraitObject(bounds, ref lifetime) => {
+        TyKind::TraitObject(bounds, ref lifetime, _syntax) => {
             for bound in bounds {
                 visitor.visit_poly_trait_ref(bound, TraitBoundModifier::None);
             }
@@ -869,11 +895,15 @@ pub fn walk_generic_param<'v, V: Visitor<'v>>(visitor: &mut V, param: &'v Generi
         GenericParamKind::Const { ref ty, ref default } => {
             visitor.visit_ty(ty);
             if let Some(ref default) = default {
-                visitor.visit_anon_const(default);
+                visitor.visit_const_param_default(param.hir_id, default);
             }
         }
     }
     walk_list!(visitor, visit_param_bound, param.bounds);
+}
+
+pub fn walk_const_param_default<'v, V: Visitor<'v>>(visitor: &mut V, ct: &'v AnonConst) {
+    visitor.visit_anon_const(ct)
 }
 
 pub fn walk_generics<'v, V: Visitor<'v>>(visitor: &mut V, generics: &'v Generics<'v>) {
@@ -1045,14 +1075,14 @@ pub fn walk_struct_def<'v, V: Visitor<'v>>(
     struct_definition: &'v VariantData<'v>,
 ) {
     walk_list!(visitor, visit_id, struct_definition.ctor_hir_id());
-    walk_list!(visitor, visit_struct_field, struct_definition.fields());
+    walk_list!(visitor, visit_field_def, struct_definition.fields());
 }
 
-pub fn walk_struct_field<'v, V: Visitor<'v>>(visitor: &mut V, struct_field: &'v StructField<'v>) {
-    visitor.visit_id(struct_field.hir_id);
-    visitor.visit_vis(&struct_field.vis);
-    visitor.visit_ident(struct_field.ident);
-    visitor.visit_ty(&struct_field.ty);
+pub fn walk_field_def<'v, V: Visitor<'v>>(visitor: &mut V, field: &'v FieldDef<'v>) {
+    visitor.visit_id(field.hir_id);
+    visitor.visit_vis(&field.vis);
+    visitor.visit_ident(field.ident);
+    visitor.visit_ty(&field.ty);
 }
 
 pub fn walk_block<'v, V: Visitor<'v>>(visitor: &mut V, block: &'v Block<'v>) {
@@ -1178,25 +1208,7 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr<'v>) 
             walk_list!(visitor, visit_expr, optional_expression);
         }
         ExprKind::InlineAsm(ref asm) => {
-            for (op, _op_sp) in asm.operands {
-                match op {
-                    InlineAsmOperand::In { expr, .. }
-                    | InlineAsmOperand::InOut { expr, .. }
-                    | InlineAsmOperand::Const { expr, .. }
-                    | InlineAsmOperand::Sym { expr, .. } => visitor.visit_expr(expr),
-                    InlineAsmOperand::Out { expr, .. } => {
-                        if let Some(expr) = expr {
-                            visitor.visit_expr(expr);
-                        }
-                    }
-                    InlineAsmOperand::SplitInOut { in_expr, out_expr, .. } => {
-                        visitor.visit_expr(in_expr);
-                        if let Some(out_expr) = out_expr {
-                            visitor.visit_expr(out_expr);
-                        }
-                    }
-                }
-            }
+            walk_inline_asm(visitor, asm);
         }
         ExprKind::LlvmInlineAsm(ref asm) => {
             walk_list!(visitor, visit_expr, asm.outputs_exprs);

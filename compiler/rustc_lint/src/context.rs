@@ -16,7 +16,7 @@
 
 use self::TargetLint::*;
 
-use crate::levels::LintLevelsBuilder;
+use crate::levels::{is_known_lint_tool, LintLevelsBuilder};
 use crate::passes::{EarlyLintPassObject, LateLintPassObject};
 use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
@@ -45,6 +45,7 @@ use rustc_target::abi::LayoutOf;
 use tracing::debug;
 
 use std::cell::Cell;
+use std::iter;
 use std::slice;
 
 /// Information about the registered lints.
@@ -100,6 +101,11 @@ enum TargetLint {
     /// Lint with this name existed previously, but has been removed/deprecated.
     /// The string argument is the reason for removal.
     Removed(String),
+
+    /// A lint name that should give no warnings and have no effect.
+    ///
+    /// This is used by rustc to avoid warning about old rustdoc lints before rustdoc registers them as tool lints.
+    Ignored,
 }
 
 pub enum FindLintError {
@@ -123,6 +129,8 @@ pub enum CheckLintNameResult<'a> {
     Ok(&'a [LintId]),
     /// Lint doesn't exist. Potentially contains a suggestion for a correct lint name.
     NoLint(Option<Symbol>),
+    /// The lint refers to a tool that has not been registered.
+    NoTool,
     /// The lint is either renamed or removed. This is the warning
     /// message, and an optional new name (`None` if removed).
     Warning(String, Option<String>),
@@ -171,6 +179,7 @@ impl LintStore {
         self.early_passes.push(Box::new(pass));
     }
 
+    /// Used by clippy.
     pub fn register_pre_expansion_pass(
         &mut self,
         pass: impl Fn() -> EarlyLintPassObject + 'static + sync::Send + sync::Sync,
@@ -202,8 +211,8 @@ impl LintStore {
                 bug!("duplicate specification of lint {}", lint.name_lower())
             }
 
-            if let Some(FutureIncompatibleInfo { edition, .. }) = lint.future_incompatible {
-                if let Some(edition) = edition {
+            if let Some(FutureIncompatibleInfo { reason, .. }) = lint.future_incompatible {
+                if let Some(edition) = reason.edition() {
                     self.lint_groups
                         .entry(edition.lint_name())
                         .or_insert(LintGroup {
@@ -213,17 +222,20 @@ impl LintStore {
                         })
                         .lint_ids
                         .push(id);
+                } else {
+                    // Lints belonging to the `future_incompatible` lint group are lints where a
+                    // future version of rustc will cause existing code to stop compiling.
+                    // Lints tied to an edition don't count because they are opt-in.
+                    self.lint_groups
+                        .entry("future_incompatible")
+                        .or_insert(LintGroup {
+                            lint_ids: vec![],
+                            from_plugin: lint.is_plugin,
+                            depr: None,
+                        })
+                        .lint_ids
+                        .push(id);
                 }
-
-                self.lint_groups
-                    .entry("future_incompatible")
-                    .or_insert(LintGroup {
-                        lint_ids: vec![],
-                        from_plugin: lint.is_plugin,
-                        depr: None,
-                    })
-                    .lint_ids
-                    .push(id);
             }
         }
     }
@@ -266,6 +278,17 @@ impl LintStore {
         }
     }
 
+    /// This lint should give no warning and have no effect.
+    ///
+    /// This is used by rustc to avoid warning about old rustdoc lints before rustdoc registers them as tool lints.
+    #[track_caller]
+    pub fn register_ignored(&mut self, name: &str) {
+        if self.by_name.insert(name.to_string(), Ignored).is_some() {
+            bug!("duplicate specification of lint {}", name);
+        }
+    }
+
+    /// This lint has been renamed; warn about using the new name and apply the lint.
     #[track_caller]
     pub fn register_renamed(&mut self, old_name: &str, new_name: &str) {
         let target = match self.by_name.get(new_name) {
@@ -284,6 +307,7 @@ impl LintStore {
             Some(&Id(lint_id)) => Ok(vec![lint_id]),
             Some(&Renamed(_, lint_id)) => Ok(vec![lint_id]),
             Some(&Removed(_)) => Err(FindLintError::Removed),
+            Some(&Ignored) => Ok(vec![]),
             None => loop {
                 return match self.lint_groups.get(lint_name) {
                     Some(LintGroup { lint_ids, depr, .. }) => {
@@ -299,9 +323,17 @@ impl LintStore {
         }
     }
 
-    /// Checks the validity of lint names derived from the command line
-    pub fn check_lint_name_cmdline(&self, sess: &Session, lint_name: &str, level: Level) {
-        let db = match self.check_lint_name(lint_name, None) {
+    /// Checks the validity of lint names derived from the command line.
+    pub fn check_lint_name_cmdline(
+        &self,
+        sess: &Session,
+        lint_name: &str,
+        level: Level,
+        crate_attrs: &[ast::Attribute],
+    ) {
+        let (tool_name, lint_name_only) = parse_lint_and_tool_name(lint_name);
+
+        let db = match self.check_lint_name(sess, lint_name_only, tool_name, crate_attrs) {
             CheckLintNameResult::Ok(_) => None,
             CheckLintNameResult::Warning(ref msg, _) => Some(sess.struct_warn(msg)),
             CheckLintNameResult::NoLint(suggestion) => {
@@ -323,6 +355,13 @@ impl LintStore {
                 ))),
                 _ => None,
             },
+            CheckLintNameResult::NoTool => Some(struct_span_err!(
+                sess,
+                DUMMY_SP,
+                E0602,
+                "unknown lint tool: `{}`",
+                tool_name.unwrap()
+            )),
         };
 
         if let Some(mut db) = db {
@@ -331,6 +370,7 @@ impl LintStore {
                 match level {
                     Level::Allow => "-A",
                     Level::Warn => "-W",
+                    Level::ForceWarn => "--force-warns",
                     Level::Deny => "-D",
                     Level::Forbid => "-F",
                 },
@@ -364,9 +404,17 @@ impl LintStore {
     /// printing duplicate warnings.
     pub fn check_lint_name(
         &self,
+        sess: &Session,
         lint_name: &str,
         tool_name: Option<Symbol>,
+        crate_attrs: &[ast::Attribute],
     ) -> CheckLintNameResult<'_> {
+        if let Some(tool_name) = tool_name {
+            if !is_known_lint_tool(tool_name, sess, crate_attrs) {
+                return CheckLintNameResult::NoTool;
+            }
+        }
+
         let complete_name = if let Some(tool_name) = tool_name {
             format!("{}::{}", tool_name, lint_name)
         } else {
@@ -427,6 +475,7 @@ impl LintStore {
                 }
             },
             Some(&Id(ref id)) => CheckLintNameResult::Ok(slice::from_ref(id)),
+            Some(&Ignored) => CheckLintNameResult::Ok(&[]),
         }
     }
 
@@ -673,6 +722,18 @@ pub trait LintContext: Sized {
                 BuiltinLintDiagnostics::ProcMacroBackCompat(note) => {
                     db.note(&note);
                 }
+                BuiltinLintDiagnostics::OrPatternsBackCompat(span,suggestion) => {
+                    db.span_suggestion(span, "use pat_param to preserve semantics", suggestion, Applicability::MachineApplicable);
+                }
+                BuiltinLintDiagnostics::ReservedPrefix(span) => {
+                    db.span_label(span, "unknown prefix");
+                    db.span_suggestion_verbose(
+                        span.shrink_to_hi(),
+                        "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
+                        " ".into(),
+                        Applicability::MachineApplicable,
+                    );
+                }
             }
             // Rewrap `db`, and pass control to the user.
             decorate(LintDiagnosticBuilder::new(db));
@@ -714,7 +775,7 @@ impl<'a> EarlyContext<'a> {
             sess,
             krate,
             lint_store,
-            builder: LintLevelsBuilder::new(sess, warn_about_weird_lints, lint_store),
+            builder: LintLevelsBuilder::new(sess, warn_about_weird_lints, lint_store, &krate.attrs),
             buffered,
         }
     }
@@ -827,10 +888,12 @@ impl<'tcx> LateContext<'tcx> {
     ///     // The given `def_id` is that of an `Option` type
     /// }
     /// ```
+    ///
+    /// Used by clippy, but should be replaced by diagnostic items eventually.
     pub fn match_def_path(&self, def_id: DefId, path: &[Symbol]) -> bool {
         let names = self.get_def_path(def_id);
 
-        names.len() == path.len() && names.into_iter().zip(path.iter()).all(|(a, &b)| a == b)
+        names.len() == path.len() && iter::zip(names, path).all(|(a, &b)| a == b)
     }
 
     /// Gets the absolute path of `def_id` as a vector of `Symbol`.
@@ -871,7 +934,7 @@ impl<'tcx> LateContext<'tcx> {
 
             fn print_dyn_existential(
                 self,
-                _predicates: &'tcx ty::List<ty::Binder<ty::ExistentialPredicate<'tcx>>>,
+                _predicates: &'tcx ty::List<ty::Binder<'tcx, ty::ExistentialPredicate<'tcx>>>,
             ) -> Result<Self::DynExistential, Self::Error> {
                 Ok(())
             }
@@ -881,7 +944,7 @@ impl<'tcx> LateContext<'tcx> {
             }
 
             fn path_crate(self, cnum: CrateNum) -> Result<Self::Path, Self::Error> {
-                Ok(vec![self.tcx.original_crate_name(cnum)])
+                Ok(vec![self.tcx.crate_name(cnum)])
             }
 
             fn path_qualified(
@@ -965,5 +1028,16 @@ impl<'tcx> LayoutOf for LateContext<'tcx> {
 
     fn layout_of(&self, ty: Ty<'tcx>) -> Self::TyAndLayout {
         self.tcx.layout_of(self.param_env.and(ty))
+    }
+}
+
+pub fn parse_lint_and_tool_name(lint_name: &str) -> (Option<Symbol>, &str) {
+    match lint_name.split_once("::") {
+        Some((tool_name, lint_name)) => {
+            let tool_name = Symbol::intern(tool_name);
+
+            (Some(tool_name), lint_name)
+        }
+        None => (None, lint_name),
     }
 }

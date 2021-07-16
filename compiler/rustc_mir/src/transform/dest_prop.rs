@@ -114,7 +114,7 @@ use rustc_middle::mir::{
     traversal, Body, InlineAsmOperand, Local, LocalKind, Location, Operand, Place, PlaceElem,
     Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
 };
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::TyCtxt;
 
 // Empirical measurements have resulted in some observations:
 // - Running on a body with a single block and 500 locals takes barely any time
@@ -720,9 +720,6 @@ impl Conflicts<'a> {
                                 }
                             }
                         }
-                        InlineAsmOperand::Const { value } => {
-                            assert!(value.place().is_none());
-                        }
                         InlineAsmOperand::InOut {
                             reg: _,
                             late: _,
@@ -731,6 +728,7 @@ impl Conflicts<'a> {
                         }
                         | InlineAsmOperand::In { reg: _, value: _ }
                         | InlineAsmOperand::Out { reg: _, late: _, place: None }
+                        | InlineAsmOperand::Const { value: _ }
                         | InlineAsmOperand::SymFn { value: _ }
                         | InlineAsmOperand::SymStatic { def_id: _ } => {}
                     }
@@ -912,17 +910,8 @@ impl<'a, 'tcx> Visitor<'tcx> for FindAssignments<'a, 'tcx> {
 
             // Handle the "subtle case" described above by rejecting any `dest` that is or
             // projects through a union.
-            let is_union = |ty: Ty<'_>| {
-                if let ty::Adt(def, _) = ty.kind() {
-                    if def.is_union() {
-                        return true;
-                    }
-                }
-
-                false
-            };
             let mut place_ty = PlaceTy::from_ty(self.body.local_decls[dest.local].ty);
-            if is_union(place_ty.ty) {
+            if place_ty.ty.is_union() {
                 return;
             }
             for elem in dest.projection {
@@ -932,7 +921,7 @@ impl<'a, 'tcx> Visitor<'tcx> for FindAssignments<'a, 'tcx> {
                 }
 
                 place_ty = place_ty.projection_ty(self.tcx, elem);
-                if is_union(place_ty.ty) {
+                if place_ty.ty.is_union() {
                     return;
                 }
             }

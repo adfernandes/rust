@@ -14,16 +14,28 @@ use rustc_span::{Span, DUMMY_SP};
 pub trait Key {
     /// Given an instance of this key, what crate is it referring to?
     /// This is used to find the provider.
-    fn query_crate(&self) -> CrateNum;
+    fn query_crate_is_local(&self) -> bool;
 
     /// In the event that a cycle occurs, if no explicit span has been
     /// given for a query with key `self`, what span should we use?
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span;
 }
 
+impl Key for () {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
 impl<'tcx> Key for ty::InstanceDef<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
@@ -32,8 +44,9 @@ impl<'tcx> Key for ty::InstanceDef<'tcx> {
 }
 
 impl<'tcx> Key for ty::Instance<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
@@ -42,8 +55,9 @@ impl<'tcx> Key for ty::Instance<'tcx> {
 }
 
 impl<'tcx> Key for mir::interpret::GlobalId<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        self.instance.query_crate()
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
@@ -52,8 +66,9 @@ impl<'tcx> Key for mir::interpret::GlobalId<'tcx> {
 }
 
 impl<'tcx> Key for mir::interpret::LitToConstInput<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
@@ -62,8 +77,9 @@ impl<'tcx> Key for mir::interpret::LitToConstInput<'tcx> {
 }
 
 impl Key for CrateNum {
-    fn query_crate(&self) -> CrateNum {
-        *self
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        *self == LOCAL_CRATE
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -71,8 +87,9 @@ impl Key for CrateNum {
 }
 
 impl Key for LocalDefId {
-    fn query_crate(&self) -> CrateNum {
-        self.to_def_id().query_crate()
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.to_def_id().default_span(tcx)
@@ -80,8 +97,9 @@ impl Key for LocalDefId {
 }
 
 impl Key for DefId {
-    fn query_crate(&self) -> CrateNum {
-        self.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(*self)
@@ -89,8 +107,9 @@ impl Key for DefId {
 }
 
 impl Key for ty::WithOptConstParam<LocalDefId> {
-    fn query_crate(&self) -> CrateNum {
-        self.did.query_crate()
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.did.default_span(tcx)
@@ -98,8 +117,9 @@ impl Key for ty::WithOptConstParam<LocalDefId> {
 }
 
 impl Key for (DefId, DefId) {
-    fn query_crate(&self) -> CrateNum {
-        self.0.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
@@ -107,8 +127,9 @@ impl Key for (DefId, DefId) {
 }
 
 impl Key for (ty::Instance<'tcx>, LocalDefId) {
-    fn query_crate(&self) -> CrateNum {
-        self.0.query_crate()
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
@@ -116,8 +137,9 @@ impl Key for (ty::Instance<'tcx>, LocalDefId) {
 }
 
 impl Key for (DefId, LocalDefId) {
-    fn query_crate(&self) -> CrateNum {
-        self.0.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
@@ -125,8 +147,9 @@ impl Key for (DefId, LocalDefId) {
 }
 
 impl Key for (LocalDefId, DefId) {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
@@ -134,8 +157,9 @@ impl Key for (LocalDefId, DefId) {
 }
 
 impl Key for (DefId, Option<Ident>) {
-    fn query_crate(&self) -> CrateNum {
-        self.0.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.0)
@@ -143,8 +167,9 @@ impl Key for (DefId, Option<Ident>) {
 }
 
 impl Key for (DefId, LocalDefId, Ident) {
-    fn query_crate(&self) -> CrateNum {
-        self.0.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
@@ -152,8 +177,9 @@ impl Key for (DefId, LocalDefId, Ident) {
 }
 
 impl Key for (CrateNum, DefId) {
-    fn query_crate(&self) -> CrateNum {
-        self.0
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0 == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
@@ -161,8 +187,9 @@ impl Key for (CrateNum, DefId) {
 }
 
 impl Key for (DefId, SimplifiedType) {
-    fn query_crate(&self) -> CrateNum {
-        self.0.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
@@ -170,8 +197,9 @@ impl Key for (DefId, SimplifiedType) {
 }
 
 impl<'tcx> Key for SubstsRef<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -179,8 +207,9 @@ impl<'tcx> Key for SubstsRef<'tcx> {
 }
 
 impl<'tcx> Key for (DefId, SubstsRef<'tcx>) {
-    fn query_crate(&self) -> CrateNum {
-        self.0.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
@@ -193,8 +222,9 @@ impl<'tcx> Key
         (ty::WithOptConstParam<DefId>, SubstsRef<'tcx>),
     )
 {
-    fn query_crate(&self) -> CrateNum {
-        (self.0).0.did.krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        (self.0).0.did.krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         (self.0).0.did.default_span(tcx)
@@ -202,8 +232,9 @@ impl<'tcx> Key
 }
 
 impl<'tcx> Key for (LocalDefId, DefId, SubstsRef<'tcx>) {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
@@ -211,8 +242,9 @@ impl<'tcx> Key for (LocalDefId, DefId, SubstsRef<'tcx>) {
 }
 
 impl<'tcx> Key for (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>) {
-    fn query_crate(&self) -> CrateNum {
-        self.1.def_id().krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.1.def_id().krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.1.def_id())
@@ -220,8 +252,19 @@ impl<'tcx> Key for (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>) {
 }
 
 impl<'tcx> Key for (&'tcx ty::Const<'tcx>, mir::Field) {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl<'tcx> Key for mir::interpret::ConstAlloc<'tcx> {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -229,8 +272,9 @@ impl<'tcx> Key for (&'tcx ty::Const<'tcx>, mir::Field) {
 }
 
 impl<'tcx> Key for ty::PolyTraitRef<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        self.def_id().krate
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.def_id().krate == LOCAL_CRATE
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.def_id())
@@ -238,8 +282,19 @@ impl<'tcx> Key for ty::PolyTraitRef<'tcx> {
 }
 
 impl<'tcx> Key for GenericArg<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl<'tcx> Key for mir::ConstantKind<'tcx> {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -247,8 +302,9 @@ impl<'tcx> Key for GenericArg<'tcx> {
 }
 
 impl<'tcx> Key for &'tcx ty::Const<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -256,8 +312,9 @@ impl<'tcx> Key for &'tcx ty::Const<'tcx> {
 }
 
 impl<'tcx> Key for Ty<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -265,8 +322,9 @@ impl<'tcx> Key for Ty<'tcx> {
 }
 
 impl<'tcx> Key for &'tcx ty::List<ty::Predicate<'tcx>> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -274,8 +332,9 @@ impl<'tcx> Key for &'tcx ty::List<ty::Predicate<'tcx>> {
 }
 
 impl<'tcx> Key for ty::ParamEnv<'tcx> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -283,8 +342,9 @@ impl<'tcx> Key for ty::ParamEnv<'tcx> {
 }
 
 impl<'tcx, T: Key> Key for ty::ParamEnvAnd<'tcx, T> {
-    fn query_crate(&self) -> CrateNum {
-        self.value.query_crate()
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.value.query_crate_is_local()
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.value.default_span(tcx)
@@ -292,8 +352,9 @@ impl<'tcx, T: Key> Key for ty::ParamEnvAnd<'tcx, T> {
 }
 
 impl Key for Symbol {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP
@@ -303,8 +364,9 @@ impl Key for Symbol {
 /// Canonical query goals correspond to abstract trait operations that
 /// are not tied to any crate in particular.
 impl<'tcx, T> Key for Canonical<'tcx, T> {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
@@ -313,8 +375,9 @@ impl<'tcx, T> Key for Canonical<'tcx, T> {
 }
 
 impl Key for (Symbol, u32, u32) {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
@@ -323,8 +386,9 @@ impl Key for (Symbol, u32, u32) {
 }
 
 impl<'tcx> Key for (DefId, Ty<'tcx>, SubstsRef<'tcx>, ty::ParamEnv<'tcx>) {
-    fn query_crate(&self) -> CrateNum {
-        LOCAL_CRATE
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
     }
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {

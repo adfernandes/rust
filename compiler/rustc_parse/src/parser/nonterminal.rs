@@ -1,10 +1,11 @@
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Nonterminal, NonterminalKind, Token};
+use rustc_ast::AstLike;
 use rustc_ast_pretty::pprust;
 use rustc_errors::PResult;
 use rustc_span::symbol::{kw, Ident};
 
-use crate::parser::pat::{GateOr, RecoverComma};
+use crate::parser::pat::{RecoverColon, RecoverComma};
 use crate::parser::{FollowedByType, ForceCollect, Parser, PathStyle};
 
 impl<'a> Parser<'a> {
@@ -61,7 +62,8 @@ impl<'a> Parser<'a> {
                 },
                 _ => false,
             },
-            NonterminalKind::Pat2018 { .. } | NonterminalKind::Pat2021 { .. } => match token.kind {
+            NonterminalKind::PatParam { .. } | NonterminalKind::PatWithOr { .. } => {
+                match token.kind {
                 token::Ident(..) |                  // box, ref, mut, and other identifiers (can stricten)
                 token::OpenDelim(token::Paren) |    // tuple pattern
                 token::OpenDelim(token::Bracket) |  // slice pattern
@@ -75,10 +77,11 @@ impl<'a> Parser<'a> {
                 token::Lt |                         // path (UFCS constant)
                 token::BinOp(token::Shl) => true,   // path (double UFCS)
                 // leading vert `|` or-pattern
-                token::BinOp(token::Or) =>  matches!(kind, NonterminalKind::Pat2021 {..}),
+                token::BinOp(token::Or) =>  matches!(kind, NonterminalKind::PatWithOr {..}),
                 token::Interpolated(ref nt) => may_be_ident(nt),
                 _ => false,
-            },
+            }
+            }
             NonterminalKind::Lifetime => match token.kind {
                 token::Lifetime(_) => true,
                 token::Interpolated(ref nt) => {
@@ -100,7 +103,7 @@ impl<'a> Parser<'a> {
         // which requires having captured tokens available. Since we cannot determine
         // in advance whether or not a proc-macro will be (transitively) invoked,
         // we always capture tokens for any `Nonterminal` which needs them.
-        Ok(match kind {
+        let mut nt = match kind {
             NonterminalKind::Item => match self.parse_item(ForceCollect::Yes)? {
                 Some(item) => token::NtItem(item),
                 None => {
@@ -118,32 +121,17 @@ impl<'a> Parser<'a> {
                     return Err(self.struct_span_err(self.token.span, "expected a statement"));
                 }
             },
-            NonterminalKind::Pat2018 { .. } | NonterminalKind::Pat2021 { .. } => {
+            NonterminalKind::PatParam { .. } | NonterminalKind::PatWithOr { .. } => {
                 token::NtPat(self.collect_tokens_no_attrs(|this| match kind {
-                    NonterminalKind::Pat2018 { .. } => this.parse_pat_no_top_alt(None),
-                    NonterminalKind::Pat2021 { .. } => {
-                        this.parse_pat_allow_top_alt(None, GateOr::Yes, RecoverComma::No)
+                    NonterminalKind::PatParam { .. } => this.parse_pat_no_top_alt(None),
+                    NonterminalKind::PatWithOr { .. } => {
+                        this.parse_pat_allow_top_alt(None, RecoverComma::No, RecoverColon::No)
                     }
                     _ => unreachable!(),
                 })?)
             }
 
-            // If there are attributes present, then `parse_expr` will end up collecting tokens,
-            // turning the outer `collect_tokens_no_attrs` into a no-op due to the already present
-            // tokens. If there are *not* attributes present, then the outer
-            // `collect_tokens_no_attrs` will ensure that we will end up collecting tokens for the
-            // expressions.
-            //
-            // This is less efficient than it could be, since the outer `collect_tokens_no_attrs`
-            // still needs to snapshot the `TokenCursor` before calling `parse_expr`, even when
-            // `parse_expr` will end up collecting tokens. Ideally, this would work more like
-            // `parse_item`, and take in a `ForceCollect` parameter. However, this would require
-            // adding a `ForceCollect` parameter in a bunch of places in expression parsing
-            // for little gain. If the perf impact from this turns out to be noticeable, we should
-            // revisit this apporach.
-            NonterminalKind::Expr => {
-                token::NtExpr(self.collect_tokens_no_attrs(|this| this.parse_expr())?)
-            }
+            NonterminalKind::Expr => token::NtExpr(self.parse_expr_force_collect()?),
             NonterminalKind::Literal => {
                 // The `:literal` matcher does not support attributes
                 token::NtLiteral(
@@ -168,9 +156,7 @@ impl<'a> Parser<'a> {
             NonterminalKind::Path => token::NtPath(
                 self.collect_tokens_no_attrs(|this| this.parse_path(PathStyle::Type))?,
             ),
-            NonterminalKind::Meta => {
-                token::NtMeta(P(self.collect_tokens_no_attrs(|this| this.parse_attr_item(false))?))
-            }
+            NonterminalKind::Meta => token::NtMeta(P(self.parse_attr_item(true)?)),
             NonterminalKind::TT => token::NtTT(self.parse_token_tree()),
             NonterminalKind::Vis => token::NtVis(
                 self.collect_tokens_no_attrs(|this| this.parse_visibility(FollowedByType::Yes))?,
@@ -184,7 +170,19 @@ impl<'a> Parser<'a> {
                     return Err(self.struct_span_err(self.token.span, msg));
                 }
             }
-        })
+        };
+
+        // If tokens are supported at all, they should be collected.
+        if matches!(nt.tokens_mut(), Some(None)) {
+            panic!(
+                "Missing tokens for nt {:?} at {:?}: {:?}",
+                nt,
+                nt.span(),
+                pprust::nonterminal_to_string(&nt)
+            );
+        }
+
+        Ok(nt)
     }
 }
 

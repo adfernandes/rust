@@ -2,10 +2,13 @@ use crate::cmp;
 use crate::ffi::CStr;
 use crate::io;
 use crate::mem;
+use crate::num::NonZeroUsize;
 use crate::ptr;
 use crate::sys::{os, stack_overflow};
 use crate::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "solaris", target_os = "illumos"))]
+use crate::sys::weak::weak;
 #[cfg(not(any(target_os = "l4re", target_os = "vxworks")))]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "l4re")]
@@ -198,6 +201,88 @@ impl Drop for Thread {
     }
 }
 
+pub fn available_concurrency() -> io::Result<NonZeroUsize> {
+    cfg_if::cfg_if! {
+        if #[cfg(any(
+            target_os = "android",
+            target_os = "emscripten",
+            target_os = "fuchsia",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "illumos",
+        ))] {
+            match unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } {
+                -1 => Err(io::Error::last_os_error()),
+                0 => Err(io::Error::new_const(io::ErrorKind::NotFound, &"The number of hardware threads is not known for the target platform")),
+                cpus => Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) }),
+            }
+        } else if #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))] {
+            use crate::ptr;
+
+            let mut cpus: libc::c_uint = 0;
+            let mut cpus_size = crate::mem::size_of_val(&cpus);
+
+            unsafe {
+                cpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as libc::c_uint;
+            }
+
+            // Fallback approach in case of errors or no hardware threads.
+            if cpus < 1 {
+                let mut mib = [libc::CTL_HW, libc::HW_NCPU, 0, 0];
+                let res = unsafe {
+                    libc::sysctl(
+                        mib.as_mut_ptr(),
+                        2,
+                        &mut cpus as *mut _ as *mut _,
+                        &mut cpus_size as *mut _ as *mut _,
+                        ptr::null_mut(),
+                        0,
+                    )
+                };
+
+                // Handle errors if any.
+                if res == -1 {
+                    return Err(io::Error::last_os_error());
+                } else if cpus == 0 {
+                    return Err(io::Error::new_const(io::ErrorKind::NotFound, &"The number of hardware threads is not known for the target platform"));
+                }
+            }
+            Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) })
+        } else if #[cfg(target_os = "openbsd")] {
+            use crate::ptr;
+
+            let mut cpus: libc::c_uint = 0;
+            let mut cpus_size = crate::mem::size_of_val(&cpus);
+            let mut mib = [libc::CTL_HW, libc::HW_NCPU, 0, 0];
+
+            let res = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    2,
+                    &mut cpus as *mut _ as *mut _,
+                    &mut cpus_size as *mut _ as *mut _,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+
+            // Handle errors if any.
+            if res == -1 {
+                return Err(io::Error::last_os_error());
+            } else if cpus == 0 {
+                return Err(io::Error::new_const(io::ErrorKind::NotFound, &"The number of hardware threads is not known for the target platform"));
+            }
+
+            Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) })
+        } else {
+            // FIXME: implement on vxWorks, Redox, Haiku, l4re
+            Err(io::Error::new_const(io::ErrorKind::Unsupported, &"Getting the number of hardware threads is not supported on the target platform"))
+        }
+    }
+}
+
 #[cfg(all(
     not(target_os = "linux"),
     not(target_os = "freebsd"),
@@ -231,6 +316,7 @@ pub mod guard {
     use libc::{mmap, mprotect};
     use libc::{MAP_ANON, MAP_FAILED, MAP_FIXED, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE};
 
+    use crate::io;
     use crate::ops::Range;
     use crate::sync::atomic::{AtomicUsize, Ordering};
     use crate::sys::os;
@@ -342,6 +428,20 @@ pub mod guard {
             // it can eventually grow to. It cannot be used to determine
             // the position of kernel's stack guard.
             None
+        } else if cfg!(target_os = "freebsd") {
+            // FreeBSD's stack autogrows, and optionally includes a guard page
+            // at the bottom.  If we try to remap the bottom of the stack
+            // ourselves, FreeBSD's guard page moves upwards.  So we'll just use
+            // the builtin guard page.
+            let stackaddr = get_stack_start_aligned()?;
+            let guardaddr = stackaddr as usize;
+            // Technically the number of guard pages is tunable and controlled
+            // by the security.bsd.stack_guard_page sysctl, but there are
+            // few reasons to change it from the default.  The default value has
+            // been 1 ever since FreeBSD 11.1 and 10.4.
+            const GUARD_PAGES: usize = 1;
+            let guard = guardaddr..guardaddr + GUARD_PAGES * page_size;
+            Some(guard)
         } else {
             // Reallocate the last page of the stack.
             // This ensures SIGBUS will be raised on
@@ -361,18 +461,17 @@ pub mod guard {
                 0,
             );
             if result != stackaddr || result == MAP_FAILED {
-                panic!("failed to allocate a guard page");
+                panic!("failed to allocate a guard page: {}", io::Error::last_os_error());
             }
 
             let result = mprotect(stackaddr, page_size, PROT_NONE);
             if result != 0 {
-                panic!("failed to protect the guard page");
+                panic!("failed to protect the guard page: {}", io::Error::last_os_error());
             }
 
             let guardaddr = stackaddr as usize;
-            let offset = if cfg!(target_os = "freebsd") { 2 } else { 1 };
 
-            Some(guardaddr..guardaddr + offset * page_size)
+            Some(guardaddr..guardaddr + page_size)
         }
     }
 
@@ -416,11 +515,7 @@ pub mod guard {
             assert_eq!(libc::pthread_attr_getstack(&attr, &mut stackaddr, &mut size), 0);
 
             let stackaddr = stackaddr as usize;
-            ret = if cfg!(target_os = "freebsd") {
-                // FIXME does freebsd really fault *below* the guard addr?
-                let guardaddr = stackaddr - guardsize;
-                Some(guardaddr - PAGE_SIZE.load(Ordering::Relaxed)..guardaddr)
-            } else if cfg!(target_os = "netbsd") {
+            ret = if cfg!(any(target_os = "freebsd", target_os = "netbsd")) {
                 Some(stackaddr - guardsize..stackaddr)
             } else if cfg!(all(target_os = "linux", target_env = "musl")) {
                 Some(stackaddr - guardsize..stackaddr)

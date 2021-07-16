@@ -64,16 +64,17 @@ use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{Item, ItemKind, Node};
+use rustc_middle::dep_graph::DepContext;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::{
     self,
-    subst::{Subst, SubstsRef},
+    subst::{GenericArgKind, Subst, SubstsRef},
     Region, Ty, TyCtxt, TypeFoldable,
 };
 use rustc_span::{sym, BytePos, DesugaringKind, Pos, Span};
 use rustc_target::spec::abi;
 use std::ops::ControlFlow;
-use std::{cmp, fmt};
+use std::{cmp, fmt, iter};
 
 mod note;
 
@@ -514,7 +515,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
 
             fn print_dyn_existential(
                 self,
-                _predicates: &'tcx ty::List<ty::Binder<ty::ExistentialPredicate<'tcx>>>,
+                _predicates: &'tcx ty::List<ty::Binder<'tcx, ty::ExistentialPredicate<'tcx>>>,
             ) -> Result<Self::DynExistential, Self::Error> {
                 Err(NonTrivialPath)
             }
@@ -524,7 +525,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
             }
 
             fn path_crate(self, cnum: CrateNum) -> Result<Self::Path, Self::Error> {
-                Ok(vec![self.tcx.original_crate_name(cnum).to_string()])
+                Ok(vec![self.tcx.crate_name(cnum).to_string()])
             }
             fn path_qualified(
                 self,
@@ -957,33 +958,27 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     ) -> SubstsRef<'tcx> {
         let generics = self.tcx.generics_of(def_id);
         let mut num_supplied_defaults = 0;
-        let mut type_params = generics
-            .params
-            .iter()
-            .rev()
-            .filter_map(|param| match param.kind {
-                ty::GenericParamDefKind::Lifetime => None,
-                ty::GenericParamDefKind::Type { has_default, .. } => {
-                    Some((param.def_id, has_default))
+
+        let default_params = generics.params.iter().rev().filter_map(|param| match param.kind {
+            ty::GenericParamDefKind::Type { has_default: true, .. } => Some(param.def_id),
+            ty::GenericParamDefKind::Const { has_default: true } => Some(param.def_id),
+            _ => None,
+        });
+        for (def_id, actual) in iter::zip(default_params, substs.iter().rev()) {
+            match actual.unpack() {
+                GenericArgKind::Const(c) => {
+                    if self.tcx.const_param_default(def_id).subst(self.tcx, substs) != c {
+                        break;
+                    }
                 }
-                ty::GenericParamDefKind::Const => None, // FIXME(const_generics_defaults)
-            })
-            .peekable();
-        let has_default = {
-            let has_default = type_params.peek().map(|(_, has_default)| has_default);
-            *has_default.unwrap_or(&false)
-        };
-        if has_default {
-            let types = substs.types().rev();
-            for ((def_id, has_default), actual) in type_params.zip(types) {
-                if !has_default {
-                    break;
+                GenericArgKind::Type(ty) => {
+                    if self.tcx.type_of(def_id).subst(self.tcx, substs) != ty {
+                        break;
+                    }
                 }
-                if self.tcx.type_of(def_id).subst(self.tcx, substs) != actual {
-                    break;
-                }
-                num_supplied_defaults += 1;
+                _ => break,
             }
+            num_supplied_defaults += 1;
         }
         let len = generics.params.len();
         let mut generics = generics.clone();
@@ -1046,7 +1041,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         let len1 = sig1.inputs().len();
         let len2 = sig2.inputs().len();
         if len1 == len2 {
-            for (i, (l, r)) in sig1.inputs().iter().zip(sig2.inputs().iter()).enumerate() {
+            for (i, (l, r)) in iter::zip(sig1.inputs(), sig2.inputs()).enumerate() {
                 let (x1, x2) = self.cmp(l, r);
                 (values.0).0.extend(x1.0);
                 (values.1).0.extend(x2.0);
@@ -1167,12 +1162,10 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                     let common_len = cmp::min(len1, len2);
                     let remainder1: Vec<_> = sub1.types().skip(common_len).collect();
                     let remainder2: Vec<_> = sub2.types().skip(common_len).collect();
-                    let common_default_params = remainder1
-                        .iter()
-                        .rev()
-                        .zip(remainder2.iter().rev())
-                        .filter(|(a, b)| a == b)
-                        .count();
+                    let common_default_params =
+                        iter::zip(remainder1.iter().rev(), remainder2.iter().rev())
+                            .filter(|(a, b)| a == b)
+                            .count();
                     let len = sub1.len() - common_default_params;
                     let consts_offset = len - sub1.consts().count();
 
@@ -1303,12 +1296,11 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
 
                     const SEPARATOR: &str = "::";
                     let separator_len = SEPARATOR.len();
-                    let split_idx: usize = t1_str
-                        .split(SEPARATOR)
-                        .zip(t2_str.split(SEPARATOR))
-                        .take_while(|(mod1_str, mod2_str)| mod1_str == mod2_str)
-                        .map(|(mod_str, _)| mod_str.len() + separator_len)
-                        .sum();
+                    let split_idx: usize =
+                        iter::zip(t1_str.split(SEPARATOR), t2_str.split(SEPARATOR))
+                            .take_while(|(mod1_str, mod2_str)| mod1_str == mod2_str)
+                            .map(|(mod_str, _)| mod_str.len() + separator_len)
+                            .sum();
 
                     debug!(
                         "cmp: separator_len={}, split_idx={}, min_len={}",
@@ -1613,13 +1605,19 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
             match (&terr, expected == found) {
                 (TypeError::Sorts(values), extra) => {
                     let sort_string = |ty: Ty<'tcx>| match (extra, ty.kind()) {
-                        (true, ty::Opaque(def_id, _)) => format!(
-                            " (opaque type at {})",
-                            self.tcx
+                        (true, ty::Opaque(def_id, _)) => {
+                            let pos = self
+                                .tcx
                                 .sess
                                 .source_map()
-                                .mk_substr_filename(self.tcx.def_span(*def_id)),
-                        ),
+                                .lookup_char_pos(self.tcx.def_span(*def_id).lo());
+                            format!(
+                                " (opaque type at <{}:{}:{}>)",
+                                pos.file.name.prefer_local(),
+                                pos.line,
+                                pos.col.to_usize() + 1,
+                            )
+                        }
                         (true, _) => format!(" ({})", ty.sort_string(self.tcx)),
                         (false, _) => "".to_string(),
                     };
@@ -1913,7 +1911,9 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                         .find_map(|(path, msg)| (&path_str == path).then_some(msg))
                     {
                         let mut show_suggestion = true;
-                        for (exp_ty, found_ty) in exp_substs.types().zip(found_substs.types()) {
+                        for (exp_ty, found_ty) in
+                            iter::zip(exp_substs.types(), found_substs.types())
+                        {
                             match *exp_ty.kind() {
                                 ty::Ref(_, exp_ty, _) => {
                                     match (exp_ty.kind(), found_ty.kind()) {
@@ -1966,7 +1966,33 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                 struct_span_err!(self.tcx.sess, span, E0580, "{}", failure_str)
             }
             FailureCode::Error0308(failure_str) => {
-                struct_span_err!(self.tcx.sess, span, E0308, "{}", failure_str)
+                let mut err = struct_span_err!(self.tcx.sess, span, E0308, "{}", failure_str);
+                if let ValuePairs::Types(ty::error::ExpectedFound { expected, found }) =
+                    trace.values
+                {
+                    // If a tuple of length one was expected and the found expression has
+                    // parentheses around it, perhaps the user meant to write `(expr,)` to
+                    // build a tuple (issue #86100)
+                    match (expected.kind(), found.kind()) {
+                        (ty::Tuple(_), ty::Tuple(_)) => {}
+                        (ty::Tuple(_), _) if expected.tuple_fields().count() == 1 => {
+                            if let Ok(code) = self.tcx.sess().source_map().span_to_snippet(span) {
+                                if let Some(code) =
+                                    code.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+                                {
+                                    err.span_suggestion(
+                                        span,
+                                        "use a trailing comma to create a tuple with one element",
+                                        format!("({},)", code),
+                                        Applicability::MaybeIncorrect,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                err
             }
             FailureCode::Error0644(failure_str) => {
                 struct_span_err!(self.tcx.sess, span, E0644, "{}", failure_str)
@@ -2405,9 +2431,6 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                 self.tcx.associated_item(def_id).ident
             ),
             infer::EarlyBoundRegion(_, name) => format!(" for lifetime parameter `{}`", name),
-            infer::BoundRegionInCoherence(name) => {
-                format!(" for lifetime parameter `{}` in coherence check", name)
-            }
             infer::UpvarRegion(ref upvar_id, _) => {
                 let var_name = self.tcx.hir().name(upvar_id.var_path.hir_id);
                 format!(" for capture of `{}` by closure", var_name)

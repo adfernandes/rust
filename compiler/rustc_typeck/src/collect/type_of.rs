@@ -9,7 +9,7 @@ use rustc_hir::{HirId, Node};
 use rustc_middle::hir::map::Map;
 use rustc_middle::ty::subst::{GenericArgKind, InternalSubsts};
 use rustc_middle::ty::util::IntTypeExt;
-use rustc_middle::ty::{self, DefIdTree, Ty, TyCtxt, TypeFoldable};
+use rustc_middle::ty::{self, DefIdTree, Ty, TyCtxt, TypeFoldable, TypeFolder};
 use rustc_span::symbol::Ident;
 use rustc_span::{Span, DUMMY_SP};
 
@@ -83,7 +83,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                     return generics
                         .params
                         .iter()
-                        .filter(|param| matches!(param.kind, ty::GenericParamDefKind::Const))
+                        .filter(|param| matches!(param.kind, ty::GenericParamDefKind::Const { .. }))
                         .nth(arg_index)
                         .map(|param| param.def_id);
                 }
@@ -121,7 +121,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                 tcx.generics_of(type_dependent_def)
                     .params
                     .iter()
-                    .filter(|param| matches!(param.kind, ty::GenericParamDefKind::Const))
+                    .filter(|param| matches!(param.kind, ty::GenericParamDefKind::Const { .. }))
                     .nth(idx)
                     .map(|param| param.def_id)
             }
@@ -191,7 +191,25 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                     Res::Def(DefKind::Ctor(..), def_id) => {
                         tcx.generics_of(tcx.parent(def_id).unwrap())
                     }
-                    Res::Def(_, def_id) => tcx.generics_of(def_id),
+                    // Other `DefKind`s don't have generics and would ICE when calling
+                    // `generics_of`.
+                    Res::Def(
+                        DefKind::Struct
+                        | DefKind::Union
+                        | DefKind::Enum
+                        | DefKind::Variant
+                        | DefKind::Trait
+                        | DefKind::OpaqueTy
+                        | DefKind::TyAlias
+                        | DefKind::ForeignTy
+                        | DefKind::TraitAlias
+                        | DefKind::AssocTy
+                        | DefKind::Fn
+                        | DefKind::AssocFn
+                        | DefKind::AssocConst
+                        | DefKind::Impl,
+                        def_id,
+                    ) => tcx.generics_of(def_id),
                     Res::Err => {
                         tcx.sess.delay_span_bug(tcx.def_span(def_id), "anon const with Res::Err");
                         return None;
@@ -211,7 +229,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                 generics
                     .params
                     .iter()
-                    .filter(|param| matches!(param.kind, ty::GenericParamDefKind::Const))
+                    .filter(|param| matches!(param.kind, ty::GenericParamDefKind::Const { .. }))
                     .nth(arg_index)
                     .map(|param| param.def_id)
             }
@@ -267,7 +285,9 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
             TraitItemKind::Const(ref ty, body_id) => body_id
                 .and_then(|body_id| {
                     if is_suggestable_infer_ty(ty) {
-                        Some(infer_placeholder_type(tcx, def_id, body_id, ty.span, item.ident))
+                        Some(infer_placeholder_type(
+                            tcx, def_id, body_id, ty.span, item.ident, "constant",
+                        ))
                     } else {
                         None
                     }
@@ -286,7 +306,7 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
             }
             ImplItemKind::Const(ref ty, body_id) => {
                 if is_suggestable_infer_ty(ty) {
-                    infer_placeholder_type(tcx, def_id, body_id, ty.span, item.ident)
+                    infer_placeholder_type(tcx, def_id, body_id, ty.span, item.ident, "constant")
                 } else {
                     icx.to_ty(ty)
                 }
@@ -302,9 +322,25 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
 
         Node::Item(item) => {
             match item.kind {
-                ItemKind::Static(ref ty, .., body_id) | ItemKind::Const(ref ty, body_id) => {
+                ItemKind::Static(ref ty, .., body_id) => {
                     if is_suggestable_infer_ty(ty) {
-                        infer_placeholder_type(tcx, def_id, body_id, ty.span, item.ident)
+                        infer_placeholder_type(
+                            tcx,
+                            def_id,
+                            body_id,
+                            ty.span,
+                            item.ident,
+                            "static variable",
+                        )
+                    } else {
+                        icx.to_ty(ty)
+                    }
+                }
+                ItemKind::Const(ref ty, body_id) => {
+                    if is_suggestable_infer_ty(ty) {
+                        infer_placeholder_type(
+                            tcx, def_id, body_id, ty.span, item.ident, "constant",
+                        )
                     } else {
                         icx.to_ty(ty)
                     }
@@ -331,8 +367,8 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
                     let concrete_ty = tcx
                         .mir_borrowck(owner.expect_local())
                         .concrete_opaque_types
-                        .get(&def_id.to_def_id())
-                        .map(|opaque| opaque.concrete_type)
+                        .get_by(|(key, _)| key.def_id == def_id.to_def_id())
+                        .map(|concrete_ty| *concrete_ty)
                         .unwrap_or_else(|| {
                             tcx.sess.delay_span_bug(
                                 DUMMY_SP,
@@ -417,11 +453,13 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
             let parent_node = tcx.hir().get(tcx.hir().get_parent_node(hir_id));
             match parent_node {
                 Node::Ty(&Ty { kind: TyKind::Array(_, ref constant), .. })
-                | Node::Ty(&Ty { kind: TyKind::Typeof(ref constant), .. })
                 | Node::Expr(&Expr { kind: ExprKind::Repeat(_, ref constant), .. })
                     if constant.hir_id == hir_id =>
                 {
                     tcx.types.usize
+                }
+                Node::Ty(&Ty { kind: TyKind::Typeof(ref e), .. }) if e.hir_id == hir_id => {
+                    tcx.typeck(def_id).node_type(e.hir_id)
                 }
 
                 Node::Expr(&Expr { kind: ExprKind::ConstBlock(ref anon_const), .. })
@@ -430,15 +468,31 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
                     tcx.typeck(def_id).node_type(anon_const.hir_id)
                 }
 
+                Node::Expr(&Expr { kind: ExprKind::InlineAsm(asm), .. })
+                | Node::Item(&Item { kind: ItemKind::GlobalAsm(asm), .. })
+                    if asm.operands.iter().any(|(op, _op_sp)| match op {
+                        hir::InlineAsmOperand::Const { anon_const } => anon_const.hir_id == hir_id,
+                        _ => false,
+                    }) =>
+                {
+                    tcx.typeck(def_id).node_type(hir_id)
+                }
+
                 Node::Variant(Variant { disr_expr: Some(ref e), .. }) if e.hir_id == hir_id => tcx
                     .adt_def(tcx.hir().get_parent_did(hir_id).to_def_id())
                     .repr
                     .discr_type()
                     .to_ty(tcx),
 
+                Node::GenericParam(&GenericParam {
+                    hir_id: param_hir_id,
+                    kind: GenericParamKind::Const { default: Some(ct), .. },
+                    ..
+                }) if ct.hir_id == hir_id => tcx.type_of(tcx.hir().local_def_id(param_hir_id)),
+
                 x => tcx.ty_error_with_message(
                     DUMMY_SP,
-                    &format!("unexpected const parent in type_of_def_id(): {:?}", x),
+                    &format!("unexpected const parent in type_of(): {:?}", x),
                 ),
             }
         }
@@ -450,15 +504,14 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
         },
 
         x => {
-            bug!("unexpected sort of node in type_of_def_id(): {:?}", x);
+            bug!("unexpected sort of node in type_of(): {:?}", x);
         }
     }
 }
 
+#[instrument(skip(tcx), level = "debug")]
 fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
     use rustc_hir::{Expr, ImplItem, Item, TraitItem};
-
-    debug!("find_opaque_ty_constraints({:?})", def_id);
 
     struct ConstraintLocator<'tcx> {
         tcx: TyCtxt<'tcx>,
@@ -468,31 +521,35 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
     }
 
     impl ConstraintLocator<'_> {
+        #[instrument(skip(self), level = "debug")]
         fn check(&mut self, def_id: LocalDefId) {
             // Don't try to check items that cannot possibly constrain the type.
             if !self.tcx.has_typeck_results(def_id) {
-                debug!(
-                    "find_opaque_ty_constraints: no constraint for `{:?}` at `{:?}`: no typeck results",
-                    self.def_id, def_id,
-                );
+                debug!("no constraint: no typeck results");
                 return;
             }
             // Calling `mir_borrowck` can lead to cycle errors through
             // const-checking, avoid calling it if we don't have to.
-            if !self.tcx.typeck(def_id).concrete_opaque_types.contains_key(&self.def_id) {
-                debug!(
-                    "find_opaque_ty_constraints: no constraint for `{:?}` at `{:?}`",
-                    self.def_id, def_id,
-                );
+            if self
+                .tcx
+                .typeck(def_id)
+                .concrete_opaque_types
+                .get_by(|(key, _)| key.def_id == self.def_id)
+                .is_none()
+            {
+                debug!("no constraints in typeck results");
                 return;
             }
             // Use borrowck to get the type with unerased regions.
-            let ty = self.tcx.mir_borrowck(def_id).concrete_opaque_types.get(&self.def_id);
-            if let Some(ty::ResolvedOpaqueTy { concrete_type, substs }) = ty {
-                debug!(
-                    "find_opaque_ty_constraints: found constraint for `{:?}` at `{:?}`: {:?}",
-                    self.def_id, def_id, ty,
-                );
+            let concrete_opaque_types = &self.tcx.mir_borrowck(def_id).concrete_opaque_types;
+            debug!(?concrete_opaque_types);
+            for (opaque_type_key, concrete_type) in concrete_opaque_types {
+                if opaque_type_key.def_id != self.def_id {
+                    // Ignore constraints for other opaque types.
+                    continue;
+                }
+
+                debug!(?concrete_type, ?opaque_type_key.substs, "found constraint");
 
                 // FIXME(oli-obk): trace the actual span from inference to improve errors.
                 let span = self.tcx.def_span(def_id);
@@ -502,7 +559,7 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
                 // using `delay_span_bug`, just in case `wfcheck` slips up.
                 let opaque_generics = self.tcx.generics_of(self.def_id);
                 let mut used_params: FxHashSet<_> = FxHashSet::default();
-                for (i, arg) in substs.iter().enumerate() {
+                for (i, arg) in opaque_type_key.substs.iter().enumerate() {
                     let arg_is_param = match arg.unpack() {
                         GenericArgKind::Type(ty) => matches!(ty.kind(), ty::Param(_)),
                         GenericArgKind::Lifetime(lt) => {
@@ -541,7 +598,7 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
 
                 if let Some((prev_span, prev_ty)) = self.found {
                     if *concrete_type != prev_ty {
-                        debug!("find_opaque_ty_constraints: span={:?}", span);
+                        debug!(?span);
                         // Found different concrete types for the opaque type.
                         let mut err = self.tcx.sess.struct_span_err(
                             span,
@@ -557,11 +614,6 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
                 } else {
                     self.found = Some((span, concrete_type));
                 }
-            } else {
-                debug!(
-                    "find_opaque_ty_constraints: no constraint for `{:?}` at `{:?}`",
-                    self.def_id, def_id,
-                );
             }
         }
     }
@@ -663,8 +715,8 @@ fn let_position_impl_trait_type(tcx: TyCtxt<'_>, opaque_ty_id: LocalDefId) -> Ty
     let owner_typeck_results = tcx.typeck(scope_def_id);
     let concrete_ty = owner_typeck_results
         .concrete_opaque_types
-        .get(&opaque_ty_def_id)
-        .map(|opaque| opaque.concrete_type)
+        .get_by(|(key, _)| key.def_id == opaque_ty_def_id)
+        .map(|concrete_ty| *concrete_ty)
         .unwrap_or_else(|| {
             tcx.sess.delay_span_bug(
                 DUMMY_SP,
@@ -698,13 +750,48 @@ fn let_position_impl_trait_type(tcx: TyCtxt<'_>, opaque_ty_id: LocalDefId) -> Ty
     concrete_ty
 }
 
-fn infer_placeholder_type(
-    tcx: TyCtxt<'_>,
+fn infer_placeholder_type<'a>(
+    tcx: TyCtxt<'a>,
     def_id: LocalDefId,
     body_id: hir::BodyId,
     span: Span,
     item_ident: Ident,
-) -> Ty<'_> {
+    kind: &'static str,
+) -> Ty<'a> {
+    // Attempts to make the type nameable by turning FnDefs into FnPtrs.
+    struct MakeNameable<'tcx> {
+        success: bool,
+        tcx: TyCtxt<'tcx>,
+    }
+
+    impl<'tcx> MakeNameable<'tcx> {
+        fn new(tcx: TyCtxt<'tcx>) -> Self {
+            MakeNameable { success: true, tcx }
+        }
+    }
+
+    impl TypeFolder<'tcx> for MakeNameable<'tcx> {
+        fn tcx(&self) -> TyCtxt<'tcx> {
+            self.tcx
+        }
+
+        fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
+            if !self.success {
+                return ty;
+            }
+
+            match ty.kind() {
+                ty::FnDef(def_id, _) => self.tcx.mk_fn_ptr(self.tcx.fn_sig(*def_id)),
+                // FIXME: non-capturing closures should also suggest a function pointer
+                ty::Closure(..) | ty::Generator(..) => {
+                    self.success = false;
+                    ty
+                }
+                _ => ty.super_fold_with(self),
+            }
+        }
+    }
+
     let ty = tcx.diagnostic_only_typeck(def_id).node_type(body_id.hir_id);
 
     // If this came from a free `const` or `static mut?` item,
@@ -716,24 +803,47 @@ fn infer_placeholder_type(
             // The parser provided a sub-optimal `HasPlaceholders` suggestion for the type.
             // We are typeck and have the real type, so remove that and suggest the actual type.
             err.suggestions.clear();
-            err.span_suggestion(
-                span,
-                "provide a type for the item",
-                format!("{}: {}", item_ident, ty),
-                Applicability::MachineApplicable,
-            )
-            .emit_unless(ty.references_error());
+
+            // Suggesting unnameable types won't help.
+            let mut mk_nameable = MakeNameable::new(tcx);
+            let ty = mk_nameable.fold_ty(ty);
+            let sugg_ty = if mk_nameable.success { Some(ty) } else { None };
+            if let Some(sugg_ty) = sugg_ty {
+                err.span_suggestion(
+                    span,
+                    &format!("provide a type for the {item}", item = kind),
+                    format!("{}: {}", item_ident, sugg_ty),
+                    Applicability::MachineApplicable,
+                );
+            } else {
+                err.span_note(
+                    tcx.hir().body(body_id).value.span,
+                    &format!("however, the inferred type `{}` cannot be named", ty.to_string()),
+                );
+            }
+
+            err.emit_unless(ty.references_error());
         }
         None => {
-            let mut diag = bad_placeholder_type(tcx, vec![span]);
+            let mut diag = bad_placeholder_type(tcx, vec![span], kind);
 
             if !ty.references_error() {
-                diag.span_suggestion(
-                    span,
-                    "replace `_` with the correct type",
-                    ty.to_string(),
-                    Applicability::MaybeIncorrect,
-                );
+                let mut mk_nameable = MakeNameable::new(tcx);
+                let ty = mk_nameable.fold_ty(ty);
+                let sugg_ty = if mk_nameable.success { Some(ty) } else { None };
+                if let Some(sugg_ty) = sugg_ty {
+                    diag.span_suggestion(
+                        span,
+                        "replace with the correct type",
+                        sugg_ty.to_string(),
+                        Applicability::MaybeIncorrect,
+                    );
+                } else {
+                    diag.span_note(
+                        tcx.hir().body(body_id).value.span,
+                        &format!("however, the inferred type `{}` cannot be named", ty.to_string()),
+                    );
+                }
             }
 
             diag.emit();

@@ -19,7 +19,7 @@ use super::map::{map_try_reserve_error, RandomState};
 // for `bucket.val` in the case of HashSet. I suppose we would need HKT
 // to get rid of it properly.
 
-/// A hash set implemented as a `HashMap` where the value is `()`.
+/// A [hash set] implemented as a `HashMap` where the value is `()`.
 ///
 /// As with the [`HashMap`] type, a `HashSet` requires that the elements
 /// implement the [`Eq`] and [`Hash`] traits. This can frequently be achieved by
@@ -105,6 +105,7 @@ use super::map::{map_try_reserve_error, RandomState};
 /// // use the values stored in the set
 /// ```
 ///
+/// [hash set]: crate::collections#use-the-set-variant-of-any-of-these-maps-when
 /// [`HashMap`]: crate::collections::HashMap
 /// [`RefCell`]: crate::cell::RefCell
 /// [`Cell`]: crate::cell::Cell
@@ -201,7 +202,6 @@ impl<T, S> HashSet<T, S> {
     /// v.insert(1);
     /// assert_eq!(v.len(), 1);
     /// ```
-    #[doc(alias = "length")]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn len(&self) -> usize {
@@ -874,7 +874,6 @@ where
     /// assert_eq!(set.remove(&2), true);
     /// assert_eq!(set.remove(&2), false);
     /// ```
-    #[doc(alias = "delete")]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn remove<Q: ?Sized>(&mut self, value: &Q) -> bool
@@ -1532,7 +1531,7 @@ where
     F: FnMut(&K) -> bool,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("DrainFilter { .. }")
+        f.debug_struct("DrainFilter").finish_non_exhaustive()
     }
 }
 

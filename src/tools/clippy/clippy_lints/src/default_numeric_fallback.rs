@@ -1,19 +1,21 @@
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::numeric_literal;
+use clippy_utils::source::snippet_opt;
+use if_chain::if_chain;
 use rustc_ast::ast::{LitFloatType, LitIntType, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir::{
     intravisit::{walk_expr, walk_stmt, NestedVisitorMap, Visitor},
     Body, Expr, ExprKind, HirId, Lit, Stmt, StmtKind,
 };
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::{
     hir::map::Map,
+    lint::in_external_macro,
     ty::{self, FloatTy, IntTy, PolyFnSig, Ty},
 };
 use rustc_session::{declare_lint_pass, declare_tool_lint};
-
-use if_chain::if_chain;
-
-use crate::utils::{snippet, span_lint_and_sugg};
+use std::iter;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for usage of unconstrained numeric literals which may cause default numeric fallback in type
@@ -73,19 +75,29 @@ impl<'a, 'tcx> NumericFallbackVisitor<'a, 'tcx> {
     /// Check whether a passed literal has potential to cause fallback or not.
     fn check_lit(&self, lit: &Lit, lit_ty: Ty<'tcx>) {
         if_chain! {
+                if !in_external_macro(self.cx.sess(), lit.span);
                 if let Some(ty_bound) = self.ty_bounds.last();
                 if matches!(lit.node,
                             LitKind::Int(_, LitIntType::Unsuffixed) | LitKind::Float(_, LitFloatType::Unsuffixed));
-                if !ty_bound.is_integral();
+                if !ty_bound.is_numeric();
                 then {
-                    let suffix = match lit_ty.kind() {
-                        ty::Int(IntTy::I32) => "i32",
-                        ty::Float(FloatTy::F64) => "f64",
+                    let (suffix, is_float) = match lit_ty.kind() {
+                        ty::Int(IntTy::I32) => ("i32", false),
+                        ty::Float(FloatTy::F64) => ("f64", true),
                         // Default numeric fallback never results in other types.
                         _ => return,
                     };
 
-                    let sugg = format!("{}_{}", snippet(self.cx, lit.span, ""), suffix);
+                    let src = if let Some(src) = snippet_opt(self.cx, lit.span) {
+                        src
+                    } else {
+                        match lit.node {
+                            LitKind::Int(src, _) => format!("{}", src),
+                            LitKind::Float(src, _) => format!("{}", src),
+                            _ => return,
+                        }
+                    };
+                    let sugg = numeric_literal::format(&src, Some(suffix), is_float);
                     span_lint_and_sugg(
                         self.cx,
                         DEFAULT_NUMERIC_FALLBACK,
@@ -108,7 +120,7 @@ impl<'a, 'tcx> Visitor<'tcx> for NumericFallbackVisitor<'a, 'tcx> {
         match &expr.kind {
             ExprKind::Call(func, args) => {
                 if let Some(fn_sig) = fn_sig_opt(self.cx, func.hir_id) {
-                    for (expr, bound) in args.iter().zip(fn_sig.skip_binder().inputs().iter()) {
+                    for (expr, bound) in iter::zip(*args, fn_sig.skip_binder().inputs()) {
                         // Push found arg type, then visit arg.
                         self.ty_bounds.push(TyBound::Ty(bound));
                         self.visit_expr(expr);
@@ -121,7 +133,7 @@ impl<'a, 'tcx> Visitor<'tcx> for NumericFallbackVisitor<'a, 'tcx> {
             ExprKind::MethodCall(_, _, args, _) => {
                 if let Some(def_id) = self.cx.typeck_results().type_dependent_def_id(expr.hir_id) {
                     let fn_sig = self.cx.tcx.fn_sig(def_id).skip_binder();
-                    for (expr, bound) in args.iter().zip(fn_sig.inputs().iter()) {
+                    for (expr, bound) in iter::zip(*args, fn_sig.inputs()) {
                         self.ty_bounds.push(TyBound::Ty(bound));
                         self.visit_expr(expr);
                         self.ty_bounds.pop();
@@ -131,8 +143,8 @@ impl<'a, 'tcx> Visitor<'tcx> for NumericFallbackVisitor<'a, 'tcx> {
             },
 
             ExprKind::Struct(_, fields, base) => {
+                let ty = self.cx.typeck_results().expr_ty(expr);
                 if_chain! {
-                    let ty = self.cx.typeck_results().expr_ty(expr);
                     if let Some(adt_def) = ty.ty_adt_def();
                     if adt_def.is_struct();
                     if let Some(variant) = adt_def.variants.iter().next();
@@ -181,9 +193,9 @@ impl<'a, 'tcx> Visitor<'tcx> for NumericFallbackVisitor<'a, 'tcx> {
         match stmt.kind {
             StmtKind::Local(local) => {
                 if local.ty.is_some() {
-                    self.ty_bounds.push(TyBound::Any)
+                    self.ty_bounds.push(TyBound::Any);
                 } else {
-                    self.ty_bounds.push(TyBound::Nothing)
+                    self.ty_bounds.push(TyBound::Nothing);
                 }
             },
 
@@ -217,10 +229,10 @@ enum TyBound<'tcx> {
 }
 
 impl<'tcx> TyBound<'tcx> {
-    fn is_integral(self) -> bool {
+    fn is_numeric(self) -> bool {
         match self {
             TyBound::Any => true,
-            TyBound::Ty(t) => t.is_integral(),
+            TyBound::Ty(t) => t.is_numeric(),
             TyBound::Nothing => false,
         }
     }

@@ -48,13 +48,12 @@ pub use core::prelude::v1::{
 // FIXME: Attribute and internal derive macros are not documented because for them rustdoc generates
 // dead links which fail link checker testing.
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
-#[allow(deprecated)]
+#[allow(deprecated, deprecated_in_future)]
 #[doc(hidden)]
 pub use core::prelude::v1::{
     bench, global_allocator, test, test_case, RustcDecodable, RustcEncodable,
 };
 
-#[cfg(not(bootstrap))]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[doc(hidden)]
 pub use core::prelude::v1::derive;
@@ -67,7 +66,6 @@ pub use core::prelude::v1::derive;
 #[doc(hidden)]
 pub use core::prelude::v1::cfg_accessible;
 
-#[cfg(not(bootstrap))]
 #[unstable(
     feature = "cfg_eval",
     issue = "82679",

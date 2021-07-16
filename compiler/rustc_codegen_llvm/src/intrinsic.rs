@@ -162,11 +162,14 @@ impl IntrinsicCallMethods<'tcx> for Builder<'a, 'll, 'tcx> {
 
             sym::volatile_load | sym::unaligned_volatile_load => {
                 let tp_ty = substs.type_at(0);
-                let mut ptr = args[0].immediate();
-                if let PassMode::Cast(ty) = fn_abi.ret.mode {
-                    ptr = self.pointercast(ptr, self.type_ptr_to(ty.llvm_type(self)));
-                }
-                let load = self.volatile_load(ptr);
+                let ptr = args[0].immediate();
+                let load = if let PassMode::Cast(ty) = fn_abi.ret.mode {
+                    let llty = ty.llvm_type(self);
+                    let ptr = self.pointercast(ptr, self.type_ptr_to(llty));
+                    self.volatile_load(llty, ptr)
+                } else {
+                    self.volatile_load(self.layout_of(tp_ty).llvm_type(self), ptr)
+                };
                 let align = if name == sym::unaligned_volatile_load {
                     1
                 } else {
@@ -293,6 +296,44 @@ impl IntrinsicCallMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                         );
                         return;
                     }
+                }
+            }
+
+            sym::raw_eq => {
+                use abi::Abi::*;
+                let tp_ty = substs.type_at(0);
+                let layout = self.layout_of(tp_ty).layout;
+                let use_integer_compare = match layout.abi {
+                    Scalar(_) | ScalarPair(_, _) => true,
+                    Uninhabited | Vector { .. } => false,
+                    Aggregate { .. } => {
+                        // For rusty ABIs, small aggregates are actually passed
+                        // as `RegKind::Integer` (see `FnAbi::adjust_for_abi`),
+                        // so we re-use that same threshold here.
+                        layout.size <= self.data_layout().pointer_size * 2
+                    }
+                };
+
+                let a = args[0].immediate();
+                let b = args[1].immediate();
+                if layout.size.bytes() == 0 {
+                    self.const_bool(true)
+                } else if use_integer_compare {
+                    let integer_ty = self.type_ix(layout.size.bits());
+                    let ptr_ty = self.type_ptr_to(integer_ty);
+                    let a_ptr = self.bitcast(a, ptr_ty);
+                    let a_val = self.load(integer_ty, a_ptr, layout.align.abi);
+                    let b_ptr = self.bitcast(b, ptr_ty);
+                    let b_val = self.load(integer_ty, b_ptr, layout.align.abi);
+                    self.icmp(IntPredicate::IntEQ, a_val, b_val)
+                } else {
+                    let i8p_ty = self.type_i8p();
+                    let a_ptr = self.bitcast(a, i8p_ty);
+                    let b_ptr = self.bitcast(b, i8p_ty);
+                    let n = self.const_usize(layout.size.bytes());
+                    let llfn = self.get_intrinsic("memcmp");
+                    let cmp = self.call(llfn, &[a_ptr, b_ptr, n], None);
+                    self.icmp(IntPredicate::IntEQ, cmp, self.const_i32(0))
                 }
             }
 
@@ -502,7 +543,7 @@ fn codegen_msvc_try(
         // Source: MicrosoftCXXABI::getAddrOfCXXCatchHandlerType in clang
         let flags = bx.const_i32(8);
         let funclet = catchpad_rust.catch_pad(cs, &[tydesc, flags, slot]);
-        let ptr = catchpad_rust.load(slot, ptr_align);
+        let ptr = catchpad_rust.load(bx.type_i8p(), slot, ptr_align);
         catchpad_rust.call(catch_func, &[data, ptr], Some(&funclet));
         catchpad_rust.catch_ret(&funclet, caught.llbb());
 
@@ -674,11 +715,12 @@ fn gen_fn<'ll, 'tcx>(
 ) -> &'ll Value {
     let fn_abi = FnAbi::of_fn_ptr(cx, rust_fn_sig, &[]);
     let llfn = cx.declare_fn(name, &fn_abi);
-    cx.set_frame_pointer_elimination(llfn);
+    cx.set_frame_pointer_type(llfn);
     cx.apply_target_cpu_attr(llfn);
     // FIXME(eddyb) find a nicer way to do this.
     unsafe { llvm::LLVMRustSetLinkage(llfn, llvm::Linkage::InternalLinkage) };
-    let bx = Builder::new_block(cx, llfn, "entry-block");
+    let llbb = Builder::append_block(cx, llfn, "entry-block");
+    let bx = Builder::build(cx, llbb);
     codegen(bx);
     llfn
 }
@@ -1053,46 +1095,48 @@ fn generic_simd_intrinsic(
         let vec_ty = bx.type_vector(elem_ty, in_len);
 
         let (intr_name, fn_ty) = match name {
-            sym::simd_fsqrt => ("sqrt", bx.type_func(&[vec_ty], vec_ty)),
-            sym::simd_fsin => ("sin", bx.type_func(&[vec_ty], vec_ty)),
-            sym::simd_fcos => ("cos", bx.type_func(&[vec_ty], vec_ty)),
-            sym::simd_fabs => ("fabs", bx.type_func(&[vec_ty], vec_ty)),
-            sym::simd_floor => ("floor", bx.type_func(&[vec_ty], vec_ty)),
             sym::simd_ceil => ("ceil", bx.type_func(&[vec_ty], vec_ty)),
-            sym::simd_fexp => ("exp", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_fabs => ("fabs", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_fcos => ("cos", bx.type_func(&[vec_ty], vec_ty)),
             sym::simd_fexp2 => ("exp2", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_fexp => ("exp", bx.type_func(&[vec_ty], vec_ty)),
             sym::simd_flog10 => ("log10", bx.type_func(&[vec_ty], vec_ty)),
             sym::simd_flog2 => ("log2", bx.type_func(&[vec_ty], vec_ty)),
             sym::simd_flog => ("log", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_floor => ("floor", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_fma => ("fma", bx.type_func(&[vec_ty, vec_ty, vec_ty], vec_ty)),
             sym::simd_fpowi => ("powi", bx.type_func(&[vec_ty, bx.type_i32()], vec_ty)),
             sym::simd_fpow => ("pow", bx.type_func(&[vec_ty, vec_ty], vec_ty)),
-            sym::simd_fma => ("fma", bx.type_func(&[vec_ty, vec_ty, vec_ty], vec_ty)),
+            sym::simd_fsin => ("sin", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_fsqrt => ("sqrt", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_round => ("round", bx.type_func(&[vec_ty], vec_ty)),
+            sym::simd_trunc => ("trunc", bx.type_func(&[vec_ty], vec_ty)),
             _ => return_error!("unrecognized intrinsic `{}`", name),
         };
-
         let llvm_name = &format!("llvm.{0}.v{1}{2}", intr_name, in_len, elem_ty_str);
         let f = bx.declare_cfn(&llvm_name, llvm::UnnamedAddr::No, fn_ty);
         let c = bx.call(f, &args.iter().map(|arg| arg.immediate()).collect::<Vec<_>>(), None);
-        unsafe { llvm::LLVMRustSetHasUnsafeAlgebra(c) };
         Ok(c)
     }
 
     if std::matches!(
         name,
-        sym::simd_fsqrt
-            | sym::simd_fsin
-            | sym::simd_fcos
+        sym::simd_ceil
             | sym::simd_fabs
-            | sym::simd_floor
-            | sym::simd_ceil
-            | sym::simd_fexp
+            | sym::simd_fcos
             | sym::simd_fexp2
+            | sym::simd_fexp
             | sym::simd_flog10
             | sym::simd_flog2
             | sym::simd_flog
-            | sym::simd_fpowi
-            | sym::simd_fpow
+            | sym::simd_floor
             | sym::simd_fma
+            | sym::simd_fpow
+            | sym::simd_fpowi
+            | sym::simd_fsin
+            | sym::simd_fsqrt
+            | sym::simd_round
+            | sym::simd_trunc
     ) {
         return simd_simple_float_intrinsic(name, in_elem, in_ty, in_len, bx, span, args);
     }
@@ -1628,7 +1672,7 @@ unsupported {} from `{}` with element `{}` of size `{}` to `{}`"#,
             out_elem
         );
     }
-    macro_rules! arith {
+    macro_rules! arith_binary {
         ($($name: ident: $($($p: ident),* => $call: ident),*;)*) => {
             $(if name == sym::$name {
                 match in_elem.kind() {
@@ -1644,7 +1688,7 @@ unsupported {} from `{}` with element `{}` of size `{}` to `{}`"#,
             })*
         }
     }
-    arith! {
+    arith_binary! {
         simd_add: Uint, Int => add, Float => fadd;
         simd_sub: Uint, Int => sub, Float => fsub;
         simd_mul: Uint, Int => mul, Float => fmul;
@@ -1658,6 +1702,25 @@ unsupported {} from `{}` with element `{}` of size `{}` to `{}`"#,
         simd_fmax: Float => maxnum;
         simd_fmin: Float => minnum;
 
+    }
+    macro_rules! arith_unary {
+        ($($name: ident: $($($p: ident),* => $call: ident),*;)*) => {
+            $(if name == sym::$name {
+                match in_elem.kind() {
+                    $($(ty::$p(_))|* => {
+                        return Ok(bx.$call(args[0].immediate()))
+                    })*
+                    _ => {},
+                }
+                require!(false,
+                         "unsupported operation on `{}` with element `{}`",
+                         in_ty,
+                         in_elem)
+            })*
+        }
+    }
+    arith_unary! {
+        simd_neg: Int => neg, Float => fneg;
     }
 
     if name == sym::simd_saturating_add || name == sym::simd_saturating_sub {

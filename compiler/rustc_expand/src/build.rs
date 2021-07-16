@@ -253,22 +253,11 @@ impl<'a> ExtCtxt<'a> {
         let pathexpr = self.expr_path(self.path_global(sp, fn_path));
         self.expr_call(sp, pathexpr, args)
     }
-    pub fn expr_method_call(
-        &self,
-        span: Span,
-        expr: P<ast::Expr>,
-        ident: Ident,
-        mut args: Vec<P<ast::Expr>>,
-    ) -> P<ast::Expr> {
-        args.insert(0, expr);
-        let segment = ast::PathSegment::from_ident(ident.with_span_pos(span));
-        self.expr(span, ast::ExprKind::MethodCall(segment, args, span))
-    }
     pub fn expr_block(&self, b: P<ast::Block>) -> P<ast::Expr> {
         self.expr(b.span, ast::ExprKind::Block(b, None))
     }
-    pub fn field_imm(&self, span: Span, ident: Ident, e: P<ast::Expr>) -> ast::Field {
-        ast::Field {
+    pub fn field_imm(&self, span: Span, ident: Ident, e: P<ast::Expr>) -> ast::ExprField {
+        ast::ExprField {
             ident: ident.with_span_pos(span),
             expr: e,
             span,
@@ -282,15 +271,23 @@ impl<'a> ExtCtxt<'a> {
         &self,
         span: Span,
         path: ast::Path,
-        fields: Vec<ast::Field>,
+        fields: Vec<ast::ExprField>,
     ) -> P<ast::Expr> {
-        self.expr(span, ast::ExprKind::Struct(path, fields, ast::StructRest::None))
+        self.expr(
+            span,
+            ast::ExprKind::Struct(P(ast::StructExpr {
+                qself: None,
+                path,
+                fields,
+                rest: ast::StructRest::None,
+            })),
+        )
     }
     pub fn expr_struct_ident(
         &self,
         span: Span,
         id: Ident,
-        fields: Vec<ast::Field>,
+        fields: Vec<ast::ExprField>,
     ) -> P<ast::Expr> {
         self.expr_struct(span, self.path_ident(span, id), fields)
     }
@@ -413,15 +410,15 @@ impl<'a> ExtCtxt<'a> {
         path: ast::Path,
         subpats: Vec<P<ast::Pat>>,
     ) -> P<ast::Pat> {
-        self.pat(span, PatKind::TupleStruct(path, subpats))
+        self.pat(span, PatKind::TupleStruct(None, path, subpats))
     }
     pub fn pat_struct(
         &self,
         span: Span,
         path: ast::Path,
-        field_pats: Vec<ast::FieldPat>,
+        field_pats: Vec<ast::PatField>,
     ) -> P<ast::Pat> {
-        self.pat(span, PatKind::Struct(path, field_pats, false))
+        self.pat(span, PatKind::Struct(None, path, field_pats, false))
     }
     pub fn pat_tuple(&self, span: Span, pats: Vec<P<ast::Pat>>) -> P<ast::Pat> {
         self.pat(span, PatKind::Tuple(pats))
@@ -435,7 +432,7 @@ impl<'a> ExtCtxt<'a> {
 
     pub fn arm(&self, span: Span, pat: P<ast::Pat>, expr: P<ast::Expr>) -> ast::Arm {
         ast::Arm {
-            attrs: vec![],
+            attrs: AttrVec::new(),
             pat,
             guard: None,
             body: expr,

@@ -1,4 +1,3 @@
-#![feature(or_patterns)]
 #![recursion_limit = "256"]
 
 use rustc_ast as ast;
@@ -114,7 +113,7 @@ impl<'a> State<'a> {
             Node::Lifetime(a) => self.print_lifetime(&a),
             Node::Visibility(a) => self.print_visibility(&a),
             Node::GenericParam(_) => panic!("cannot print Node::GenericParam"),
-            Node::Field(_) => panic!("cannot print StructField"),
+            Node::Field(_) => panic!("cannot print Node::Field"),
             // These cases do not carry enough information in the
             // `hir_map` to reconstruct their full structure for pretty
             // printing.
@@ -170,7 +169,7 @@ pub fn print_crate<'a>(
     // When printing the AST, we sometimes need to inject `#[no_std]` here.
     // Since you can't compile the HIR, it's not necessary.
 
-    s.print_mod(&krate.item.module, s.attrs(hir::CRATE_HIR_ID));
+    s.print_mod(&krate.item, s.attrs(hir::CRATE_HIR_ID));
     s.print_remaining_comments();
     s.s.eof()
 }
@@ -219,10 +218,6 @@ pub fn generic_params_to_string(generic_params: &[GenericParam<'_>]) -> String {
 
 pub fn bounds_to_string<'b>(bounds: impl IntoIterator<Item = &'b hir::GenericBound<'b>>) -> String {
     to_string(NO_ANN, |s| s.print_bounds("", bounds))
-}
-
-pub fn param_to_string(arg: &hir::Param<'_>) -> String {
-    to_string(NO_ANN, |s| s.print_param(arg))
 }
 
 pub fn ty_to_string(ty: &hir::Ty<'_>) -> String {
@@ -410,7 +405,10 @@ impl<'a> State<'a> {
             }
             hir::TyKind::OpaqueDef(..) => self.s.word("/*impl Trait*/"),
             hir::TyKind::Path(ref qpath) => self.print_qpath(qpath, false),
-            hir::TyKind::TraitObject(bounds, ref lifetime) => {
+            hir::TyKind::TraitObject(bounds, ref lifetime, syntax) => {
+                if syntax == ast::TraitObjectSyntax::Dyn {
+                    self.word_space("dyn");
+                }
                 let mut first = true;
                 for bound in bounds {
                     if first {
@@ -661,9 +659,9 @@ impl<'a> State<'a> {
                 }
                 self.bclose(item.span);
             }
-            hir::ItemKind::GlobalAsm(ref ga) => {
-                self.head(visibility_qualified(&item.vis, "global asm"));
-                self.s.word(ga.asm.to_string());
+            hir::ItemKind::GlobalAsm(ref asm) => {
+                self.head(visibility_qualified(&item.vis, "global_asm!"));
+                self.print_inline_asm(asm);
                 self.end()
             }
             hir::ItemKind::TyAlias(ref ty, ref generics) => {
@@ -1072,8 +1070,6 @@ impl<'a> State<'a> {
     ) {
         match blk.rules {
             hir::BlockCheckMode::UnsafeBlock(..) => self.word_space("unsafe"),
-            hir::BlockCheckMode::PushUnsafeBlock(..) => self.word_space("push_unsafe"),
-            hir::BlockCheckMode::PopUnsafeBlock(..) => self.word_space("pop_unsafe"),
             hir::BlockCheckMode::DefaultBlock => (),
         }
         self.maybe_print_comment(blk.span.lo());
@@ -1096,8 +1092,8 @@ impl<'a> State<'a> {
 
     fn print_else(&mut self, els: Option<&hir::Expr<'_>>) {
         match els {
-            Some(_else) => {
-                match _else.kind {
+            Some(else_) => {
+                match else_.kind {
                     // "another else-if"
                     hir::ExprKind::If(ref i, ref then, ref e) => {
                         self.cbox(INDENT_UNIT - 1);
@@ -1114,6 +1110,26 @@ impl<'a> State<'a> {
                         self.ibox(0);
                         self.s.word(" else ");
                         self.print_block(&b)
+                    }
+                    hir::ExprKind::Match(ref expr, arms, _) => {
+                        // else if let desugared to match
+                        assert!(arms.len() == 2, "if let desugars to match with two arms");
+
+                        self.s.word(" else ");
+                        self.s.word("{");
+
+                        self.cbox(INDENT_UNIT);
+                        self.ibox(INDENT_UNIT);
+                        self.word_nbsp("match");
+                        self.print_expr_as_cond(&expr);
+                        self.s.space();
+                        self.bopen();
+                        for arm in arms {
+                            self.print_arm(arm);
+                        }
+                        self.bclose(expr.span);
+
+                        self.s.word("}");
                     }
                     // BLEAH, constraints would be great here
                     _ => {
@@ -1207,7 +1223,7 @@ impl<'a> State<'a> {
     fn print_expr_struct(
         &mut self,
         qpath: &hir::QPath<'_>,
-        fields: &[hir::Field<'_>],
+        fields: &[hir::ExprField<'_>],
         wth: &Option<&hir::Expr<'_>>,
     ) {
         self.print_qpath(qpath, true);
@@ -1333,6 +1349,113 @@ impl<'a> State<'a> {
         self.word(lit.node.to_lit_token().to_string())
     }
 
+    fn print_inline_asm(&mut self, asm: &hir::InlineAsm<'_>) {
+        enum AsmArg<'a> {
+            Template(String),
+            Operand(&'a hir::InlineAsmOperand<'a>),
+            Options(ast::InlineAsmOptions),
+        }
+
+        let mut args = vec![];
+        args.push(AsmArg::Template(ast::InlineAsmTemplatePiece::to_string(&asm.template)));
+        args.extend(asm.operands.iter().map(|(o, _)| AsmArg::Operand(o)));
+        if !asm.options.is_empty() {
+            args.push(AsmArg::Options(asm.options));
+        }
+
+        self.popen();
+        self.commasep(Consistent, &args, |s, arg| match arg {
+            AsmArg::Template(template) => s.print_string(&template, ast::StrStyle::Cooked),
+            AsmArg::Operand(op) => match op {
+                hir::InlineAsmOperand::In { reg, expr } => {
+                    s.word("in");
+                    s.popen();
+                    s.word(format!("{}", reg));
+                    s.pclose();
+                    s.space();
+                    s.print_expr(expr);
+                }
+                hir::InlineAsmOperand::Out { reg, late, expr } => {
+                    s.word(if *late { "lateout" } else { "out" });
+                    s.popen();
+                    s.word(format!("{}", reg));
+                    s.pclose();
+                    s.space();
+                    match expr {
+                        Some(expr) => s.print_expr(expr),
+                        None => s.word("_"),
+                    }
+                }
+                hir::InlineAsmOperand::InOut { reg, late, expr } => {
+                    s.word(if *late { "inlateout" } else { "inout" });
+                    s.popen();
+                    s.word(format!("{}", reg));
+                    s.pclose();
+                    s.space();
+                    s.print_expr(expr);
+                }
+                hir::InlineAsmOperand::SplitInOut { reg, late, in_expr, out_expr } => {
+                    s.word(if *late { "inlateout" } else { "inout" });
+                    s.popen();
+                    s.word(format!("{}", reg));
+                    s.pclose();
+                    s.space();
+                    s.print_expr(in_expr);
+                    s.space();
+                    s.word_space("=>");
+                    match out_expr {
+                        Some(out_expr) => s.print_expr(out_expr),
+                        None => s.word("_"),
+                    }
+                }
+                hir::InlineAsmOperand::Const { anon_const } => {
+                    s.word("const");
+                    s.space();
+                    s.print_anon_const(anon_const);
+                }
+                hir::InlineAsmOperand::Sym { expr } => {
+                    s.word("sym");
+                    s.space();
+                    s.print_expr(expr);
+                }
+            },
+            AsmArg::Options(opts) => {
+                s.word("options");
+                s.popen();
+                let mut options = vec![];
+                if opts.contains(ast::InlineAsmOptions::PURE) {
+                    options.push("pure");
+                }
+                if opts.contains(ast::InlineAsmOptions::NOMEM) {
+                    options.push("nomem");
+                }
+                if opts.contains(ast::InlineAsmOptions::READONLY) {
+                    options.push("readonly");
+                }
+                if opts.contains(ast::InlineAsmOptions::PRESERVES_FLAGS) {
+                    options.push("preserves_flags");
+                }
+                if opts.contains(ast::InlineAsmOptions::NORETURN) {
+                    options.push("noreturn");
+                }
+                if opts.contains(ast::InlineAsmOptions::NOSTACK) {
+                    options.push("nostack");
+                }
+                if opts.contains(ast::InlineAsmOptions::ATT_SYNTAX) {
+                    options.push("att_syntax");
+                }
+                if opts.contains(ast::InlineAsmOptions::RAW) {
+                    options.push("raw");
+                }
+                s.commasep(Inconsistent, &options, |s, &opt| {
+                    s.word(opt);
+                });
+                s.pclose();
+            }
+        });
+        self.pclose();
+    }
+
     pub fn print_expr(&mut self, expr: &hir::Expr<'_>) {
         self.maybe_print_comment(expr.span.lo());
         self.print_outer_attributes(self.attrs(expr.hir_id));
@@ -1416,7 +1539,6 @@ impl<'a> State<'a> {
                     self.word_space(":");
                 }
                 self.head("loop");
-                self.s.space();
                 self.print_block(&blk);
             }
             hir::ExprKind::Match(ref expr, arms, _) => {
@@ -1511,109 +1633,9 @@ impl<'a> State<'a> {
                     self.print_expr_maybe_paren(&expr, parser::PREC_JUMP);
                 }
             }
-            hir::ExprKind::InlineAsm(ref a) => {
-                enum AsmArg<'a> {
-                    Template(String),
-                    Operand(&'a hir::InlineAsmOperand<'a>),
-                    Options(ast::InlineAsmOptions),
-                }
-
-                let mut args = vec![];
-                args.push(AsmArg::Template(ast::InlineAsmTemplatePiece::to_string(&a.template)));
-                args.extend(a.operands.iter().map(|(o, _)| AsmArg::Operand(o)));
-                if !a.options.is_empty() {
-                    args.push(AsmArg::Options(a.options));
-                }
-
+            hir::ExprKind::InlineAsm(ref asm) => {
                 self.word("asm!");
-                self.popen();
-                self.commasep(Consistent, &args, |s, arg| match arg {
-                    AsmArg::Template(template) => s.print_string(&template, ast::StrStyle::Cooked),
-                    AsmArg::Operand(op) => match op {
-                        hir::InlineAsmOperand::In { reg, expr } => {
-                            s.word("in");
-                            s.popen();
-                            s.word(format!("{}", reg));
-                            s.pclose();
-                            s.space();
-                            s.print_expr(expr);
-                        }
-                        hir::InlineAsmOperand::Out { reg, late, expr } => {
-                            s.word(if *late { "lateout" } else { "out" });
-                            s.popen();
-                            s.word(format!("{}", reg));
-                            s.pclose();
-                            s.space();
-                            match expr {
-                                Some(expr) => s.print_expr(expr),
-                                None => s.word("_"),
-                            }
-                        }
-                        hir::InlineAsmOperand::InOut { reg, late, expr } => {
-                            s.word(if *late { "inlateout" } else { "inout" });
-                            s.popen();
-                            s.word(format!("{}", reg));
-                            s.pclose();
-                            s.space();
-                            s.print_expr(expr);
-                        }
-                        hir::InlineAsmOperand::SplitInOut { reg, late, in_expr, out_expr } => {
-                            s.word(if *late { "inlateout" } else { "inout" });
-                            s.popen();
-                            s.word(format!("{}", reg));
-                            s.pclose();
-                            s.space();
-                            s.print_expr(in_expr);
-                            s.space();
-                            s.word_space("=>");
-                            match out_expr {
-                                Some(out_expr) => s.print_expr(out_expr),
-                                None => s.word("_"),
-                            }
-                        }
-                        hir::InlineAsmOperand::Const { expr } => {
-                            s.word("const");
-                            s.space();
-                            s.print_expr(expr);
-                        }
-                        hir::InlineAsmOperand::Sym { expr } => {
-                            s.word("sym");
-                            s.space();
-                            s.print_expr(expr);
-                        }
-                    },
-                    AsmArg::Options(opts) => {
-                        s.word("options");
-                        s.popen();
-                        let mut options = vec![];
-                        if opts.contains(ast::InlineAsmOptions::PURE) {
-                            options.push("pure");
-                        }
-                        if opts.contains(ast::InlineAsmOptions::NOMEM) {
-                            options.push("nomem");
-                        }
-                        if opts.contains(ast::InlineAsmOptions::READONLY) {
-                            options.push("readonly");
-                        }
-                        if opts.contains(ast::InlineAsmOptions::PRESERVES_FLAGS) {
-                            options.push("preserves_flags");
-                        }
-                        if opts.contains(ast::InlineAsmOptions::NORETURN) {
-                            options.push("noreturn");
-                        }
-                        if opts.contains(ast::InlineAsmOptions::NOSTACK) {
-                            options.push("nostack");
-                        }
-                        if opts.contains(ast::InlineAsmOptions::ATT_SYNTAX) {
-                            options.push("att_syntax");
-                        }
-                        s.commasep(Inconsistent, &options, |s, &opt| {
-                            s.word(opt);
-                        });
-                        s.pclose();
-                    }
-                });
-                self.pclose();
+                self.print_inline_asm(asm);
             }
             hir::ExprKind::LlvmInlineAsm(ref a) => {
                 let i = &a.inner;
@@ -1698,19 +1720,8 @@ impl<'a> State<'a> {
         }
     }
 
-    pub fn print_usize(&mut self, i: usize) {
-        self.s.word(i.to_string())
-    }
-
     pub fn print_name(&mut self, name: Symbol) {
         self.print_ident(Ident::with_dummy_span(name))
-    }
-
-    pub fn print_for_decl(&mut self, loc: &hir::Local<'_>, coll: &hir::Expr<'_>) {
-        self.print_local_decl(loc);
-        self.s.space();
-        self.word_space("in");
-        self.print_expr(coll)
     }
 
     pub fn print_path(&mut self, path: &hir::Path<'_>, colons_before_params: bool) {
@@ -2263,8 +2274,10 @@ impl<'a> State<'a> {
             GenericParamKind::Const { ref ty, ref default } => {
                 self.word_space(":");
                 self.print_type(ty);
-                if let Some(ref _default) = default {
-                    // FIXME(const_generics_defaults): print the `default` value here
+                if let Some(ref default) = default {
+                    self.s.space();
+                    self.word_space("=");
+                    self.print_anon_const(&default)
                 }
             }
         }
@@ -2422,24 +2435,6 @@ impl<'a> State<'a> {
         }
         while let Some(ref cmnt) = self.next_comment() {
             self.print_comment(cmnt)
-        }
-    }
-
-    pub fn print_opt_abi_and_extern_if_nondefault(&mut self, opt_abi: Option<Abi>) {
-        match opt_abi {
-            Some(Abi::Rust) => {}
-            Some(abi) => {
-                self.word_nbsp("extern");
-                self.word_nbsp(abi.to_string())
-            }
-            None => {}
-        }
-    }
-
-    pub fn print_extern_opt_abi(&mut self, opt_abi: Option<Abi>) {
-        if let Some(abi) = opt_abi {
-            self.word_nbsp("extern");
-            self.word_nbsp(abi.to_string())
         }
     }
 

@@ -107,7 +107,6 @@ fn intern_shallow<'rt, 'mir, 'tcx, M: CompileTimeMachine<'mir, 'tcx, const_eval:
     match kind {
         MemoryKind::Stack
         | MemoryKind::Machine(const_eval::MemoryKind::Heap)
-        | MemoryKind::Vtable
         | MemoryKind::CallerLocation => {}
     }
     // Set allocation mutability as appropriate. This is used by LLVM to put things into
@@ -305,7 +304,6 @@ where
     let base_intern_mode = match intern_kind {
         InternKind::Static(mutbl) => InternMode::Static(mutbl),
         // `Constant` includes array lengths.
-        // `Promoted` includes non-`Copy` array initializers and `rustc_args_required_const` arguments.
         InternKind::Constant | InternKind::Promoted => InternMode::Const,
     };
 
@@ -430,7 +428,7 @@ impl<'mir, 'tcx: 'mir, M: super::intern::CompileTimeMachine<'mir, 'tcx, !>>
             &MPlaceTy<'tcx, M::PointerTag>,
         ) -> InterpResult<'tcx, ()>,
     ) -> InterpResult<'tcx, &'tcx Allocation> {
-        let dest = self.allocate(layout, MemoryKind::Stack);
+        let dest = self.allocate(layout, MemoryKind::Stack)?;
         f(self, &dest)?;
         let ptr = dest.ptr.assert_ptr();
         assert_eq!(ptr.offset, Size::ZERO);

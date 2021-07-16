@@ -11,18 +11,19 @@ use crate::check::{
 use rustc_ast as ast;
 use rustc_errors::{Applicability, DiagnosticBuilder, DiagnosticId};
 use rustc_hir as hir;
-use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{ExprKind, Node, QPath};
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::{self, Ty};
 use rustc_session::Session;
-use rustc_span::symbol::{sym, Ident};
+use rustc_span::symbol::Ident;
 use rustc_span::{self, MultiSpan, Span};
 use rustc_trait_selection::traits::{self, ObligationCauseCode, StatementAsExpression};
 
 use crate::structured_errors::StructuredDiagnostic;
+use std::iter;
 use std::slice;
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
@@ -108,7 +109,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         // All the input types from the fn signature must outlive the call
         // so as to validate implied bounds.
-        for (&fn_input_ty, arg_expr) in fn_inputs.iter().zip(args.iter()) {
+        for (&fn_input_ty, arg_expr) in iter::zip(fn_inputs, args) {
             self.register_wf_obligation(fn_input_ty.into(), arg_expr.span, traits::MiscObligation);
         }
 
@@ -119,8 +120,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                  error_code: &str,
                                  c_variadic: bool,
                                  sugg_unit: bool| {
-            let (span, start_span, args) = match &expr.kind {
-                hir::ExprKind::Call(hir::Expr { span, .. }, args) => (*span, *span, &args[..]),
+            let (span, start_span, args, ctor_of) = match &expr.kind {
+                hir::ExprKind::Call(
+                    hir::Expr {
+                        span,
+                        kind:
+                            hir::ExprKind::Path(hir::QPath::Resolved(
+                                _,
+                                hir::Path { res: Res::Def(DefKind::Ctor(of, _), _), .. },
+                            )),
+                        ..
+                    },
+                    args,
+                ) => (*span, *span, &args[..], Some(of)),
+                hir::ExprKind::Call(hir::Expr { span, .. }, args) => {
+                    (*span, *span, &args[..], None)
+                }
                 hir::ExprKind::MethodCall(path_segment, span, args, _) => (
                     *span,
                     // `sp` doesn't point at the whole `foo.bar()`, only at `bar`.
@@ -136,6 +151,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         })
                         .unwrap_or(*span),
                     &args[1..], // Skip the receiver.
+                    None,       // methods are never ctors
                 ),
                 k => span_bug!(sp, "checking argument types on a non-call: `{:?}`", k),
             };
@@ -156,7 +172,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let mut err = tcx.sess.struct_span_err_with_code(
                 span,
                 &format!(
-                    "this function takes {}{} but {} {} supplied",
+                    "this {} takes {}{} but {} {} supplied",
+                    match ctor_of {
+                        Some(CtorOf::Struct) => "struct",
+                        Some(CtorOf::Variant) => "enum variant",
+                        None => "function",
+                    },
                     if c_variadic { "at least " } else { "" },
                     potentially_plural_count(expected_count, "argument"),
                     potentially_plural_count(arg_count, "argument"),
@@ -290,7 +311,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // that are not closures, then we type-check the closures. This is so
         // that we have more information about the types of arguments when we
         // type-check the functions. This isn't really the right way to do this.
-        for &check_closures in &[false, true] {
+        for check_closures in [false, true] {
             debug!("check_closures={}", check_closures);
 
             // More awful hacks: before we check argument types, try to do
@@ -439,7 +460,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         qpath: &QPath<'_>,
         hir_id: hir::HirId,
     ) -> Option<(&'tcx ty::VariantDef, Ty<'tcx>)> {
-        let path_span = qpath.qself_span();
+        let path_span = qpath.span();
         let (def, ty) = self.finish_resolving_struct_path(qpath, path_span, hir_id);
         let variant = match def {
             Res::Err => {
@@ -719,34 +740,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         ty
     }
 
-    pub(in super::super) fn check_rustc_args_require_const(
-        &self,
-        def_id: DefId,
-        hir_id: hir::HirId,
-        span: Span,
-    ) {
-        // We're only interested in functions tagged with
-        // #[rustc_args_required_const], so ignore anything that's not.
-        if !self.tcx.has_attr(def_id, sym::rustc_args_required_const) {
-            return;
-        }
-
-        // If our calling expression is indeed the function itself, we're good!
-        // If not, generate an error that this can only be called directly.
-        if let Node::Expr(expr) = self.tcx.hir().get(self.tcx.hir().get_parent_node(hir_id)) {
-            if let ExprKind::Call(ref callee, ..) = expr.kind {
-                if callee.hir_id == hir_id {
-                    return;
-                }
-            }
-        }
-
-        self.tcx.sess.span_err(
-            span,
-            "this function can only be invoked directly, not through a function pointer",
-        );
-    }
-
     /// A common error is to add an extra semicolon:
     ///
     /// ```
@@ -875,7 +868,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         match *qpath {
             QPath::Resolved(ref maybe_qself, ref path) => {
                 let self_ty = maybe_qself.as_ref().map(|qself| self.to_ty(qself));
-                let ty = AstConv::res_to_ty(self, self_ty, path, true);
+                let ty = <dyn AstConv<'_>>::res_to_ty(self, self_ty, path, true);
                 (path.res, ty)
             }
             QPath::TypeRelative(ref qself, ref segment) => {
@@ -886,8 +879,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 } else {
                     Res::Err
                 };
-                let result =
-                    AstConv::associated_path_to_ty(self, hir_id, path_span, ty, res, segment, true);
+                let result = <dyn AstConv<'_>>::associated_path_to_ty(
+                    self, hir_id, path_span, ty, res, segment, true,
+                );
                 let ty = result.map(|(ty, _, _)| ty).unwrap_or_else(|_| self.tcx().ty_error());
                 let result = result.map(|(_, kind, def_id)| (kind, def_id));
 
@@ -984,7 +978,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             error.obligation.predicate.kind().skip_binder()
                         {
                             // If any of the type arguments in this path segment caused the
-                            // `FullfillmentError`, point at its span (#61860).
+                            // `FulfillmentError`, point at its span (#61860).
                             for arg in path
                                 .segments
                                 .iter()
@@ -1000,7 +994,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                         // would trigger in `is_send::<T::AssocType>();`
                                         // from `typeck-default-trait-impl-assoc-type.rs`.
                                     } else {
-                                        let ty = AstConv::ast_ty_to_ty(self, hir_ty);
+                                        let ty = <dyn AstConv<'_>>::ast_ty_to_ty(self, hir_ty);
                                         let ty = self.resolve_vars_if_possible(ty);
                                         if ty == predicate.self_ty() {
                                             error.obligation.cause.make_mut().span = hir_ty.span;

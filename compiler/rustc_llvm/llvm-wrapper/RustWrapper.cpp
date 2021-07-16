@@ -6,6 +6,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Object/Archive.h"
+#include "llvm/Object/COFFImportFile.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Bitcode/BitcodeWriterPass.h"
 #include "llvm/Support/Signals.h"
@@ -68,17 +69,6 @@ static void FatalErrorHandler(void *UserData,
 
 extern "C" void LLVMRustInstallFatalErrorHandler() {
   install_fatal_error_handler(FatalErrorHandler);
-}
-
-extern "C" LLVMMemoryBufferRef
-LLVMRustCreateMemoryBufferWithContentsOfFile(const char *Path) {
-  ErrorOr<std::unique_ptr<MemoryBuffer>> BufOr =
-      MemoryBuffer::getFile(Path, -1, false);
-  if (!BufOr) {
-    LLVMRustSetLastError(BufOr.getError().message().c_str());
-    return nullptr;
-  }
-  return wrap(BufOr.get().release());
 }
 
 extern "C" char *LLVMRustGetLastError(void) {
@@ -349,19 +339,20 @@ extern "C" void LLVMRustRemoveFunctionAttributes(LLVMValueRef Fn,
   F->setAttributes(PALNew);
 }
 
-// enable fpmath flag UnsafeAlgebra
-extern "C" void LLVMRustSetHasUnsafeAlgebra(LLVMValueRef V) {
+// Enable a fast-math flag
+//
+// https://llvm.org/docs/LangRef.html#fast-math-flags
+extern "C" void LLVMRustSetFastMath(LLVMValueRef V) {
   if (auto I = dyn_cast<Instruction>(unwrap<Value>(V))) {
     I->setFast(true);
   }
 }
 
 extern "C" LLVMValueRef
-LLVMRustBuildAtomicLoad(LLVMBuilderRef B, LLVMValueRef Source, const char *Name,
-                        LLVMAtomicOrdering Order) {
+LLVMRustBuildAtomicLoad(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Source,
+                        const char *Name, LLVMAtomicOrdering Order) {
   Value *Ptr = unwrap(Source);
-  Type *Ty = Ptr->getType()->getPointerElementType();
-  LoadInst *LI = unwrap(B)->CreateLoad(Ty, Ptr, Name);
+  LoadInst *LI = unwrap(B)->CreateLoad(unwrap(Ty), Ptr, Name);
   LI->setAtomic(fromRust(Order));
   return wrap(LI);
 }
@@ -382,9 +373,18 @@ LLVMRustBuildAtomicCmpXchg(LLVMBuilderRef B, LLVMValueRef Target,
                            LLVMValueRef Old, LLVMValueRef Source,
                            LLVMAtomicOrdering Order,
                            LLVMAtomicOrdering FailureOrder, LLVMBool Weak) {
+#if LLVM_VERSION_GE(13,0)
+  // Rust probably knows the alignment of the target value and should be able to
+  // specify something more precise than MaybeAlign here. See also
+  // https://reviews.llvm.org/D97224 which may be a useful reference.
+  AtomicCmpXchgInst *ACXI = unwrap(B)->CreateAtomicCmpXchg(
+      unwrap(Target), unwrap(Old), unwrap(Source), llvm::MaybeAlign(), fromRust(Order),
+      fromRust(FailureOrder));
+#else
   AtomicCmpXchgInst *ACXI = unwrap(B)->CreateAtomicCmpXchg(
       unwrap(Target), unwrap(Old), unwrap(Source), fromRust(Order),
       fromRust(FailureOrder));
+#endif
   ACXI->setWeak(Weak);
   return wrap(ACXI);
 }
@@ -532,11 +532,6 @@ static DINode::DIFlags fromRust(LLVMRustDIFlags Flags) {
   if (isSet(Flags & LLVMRustDIFlags::FlagAppleBlock)) {
     Result |= DINode::DIFlags::FlagAppleBlock;
   }
-#if LLVM_VERSION_LT(10, 0)
-  if (isSet(Flags & LLVMRustDIFlags::FlagBlockByrefStruct)) {
-    Result |= DINode::DIFlags::FlagBlockByrefStruct;
-  }
-#endif
   if (isSet(Flags & LLVMRustDIFlags::FlagVirtual)) {
     Result |= DINode::DIFlags::FlagVirtual;
   }
@@ -901,9 +896,7 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateStaticVariable(
       unwrapDI<DIDescriptor>(Context), StringRef(Name, NameLen),
       StringRef(LinkageName, LinkageNameLen),
       unwrapDI<DIFile>(File), LineNo, unwrapDI<DIType>(Ty), IsLocalToUnit,
-#if LLVM_VERSION_GE(10, 0)
       /* isDefined */ true,
-#endif
       InitExpr, unwrapDIPtr<MDNode>(Decl),
       /* templateParams */ nullptr,
       AlignInBits);
@@ -1071,38 +1064,6 @@ extern "C" void LLVMRustWriteValueToString(LLVMValueRef V,
     unwrap<llvm::Value>(V)->print(OS);
     OS << ")";
   }
-}
-
-// Note that the two following functions look quite similar to the
-// LLVMGetSectionName function. Sadly, it appears that this function only
-// returns a char* pointer, which isn't guaranteed to be null-terminated. The
-// function provided by LLVM doesn't return the length, so we've created our own
-// function which returns the length as well as the data pointer.
-//
-// For an example of this not returning a null terminated string, see
-// lib/Object/COFFObjectFile.cpp in the getSectionName function. One of the
-// branches explicitly creates a StringRef without a null terminator, and then
-// that's returned.
-
-inline section_iterator *unwrap(LLVMSectionIteratorRef SI) {
-  return reinterpret_cast<section_iterator *>(SI);
-}
-
-extern "C" size_t LLVMRustGetSectionName(LLVMSectionIteratorRef SI,
-                                         const char **Ptr) {
-#if LLVM_VERSION_GE(10, 0)
-  auto NameOrErr = (*unwrap(SI))->getName();
-  if (!NameOrErr)
-    report_fatal_error(NameOrErr.takeError());
-  *Ptr = NameOrErr->data();
-  return NameOrErr->size();
-#else
-  StringRef Ret;
-  if (std::error_code EC = (*unwrap(SI))->getName(Ret))
-    report_fatal_error(EC.message());
-  *Ptr = Ret.data();
-  return Ret.size();
-#endif
 }
 
 // LLVMArrayType function does not support 64-bit ElementCount
@@ -1304,9 +1265,19 @@ extern "C" LLVMTypeKind LLVMRustGetTypeKind(LLVMTypeRef Ty) {
 
 DEFINE_SIMPLE_CONVERSION_FUNCTIONS(SMDiagnostic, LLVMSMDiagnosticRef)
 
+#if LLVM_VERSION_LT(13, 0)
+using LLVMInlineAsmDiagHandlerTy = LLVMContext::InlineAsmDiagHandlerTy;
+#else
+using LLVMInlineAsmDiagHandlerTy = void*;
+#endif
+
 extern "C" void LLVMRustSetInlineAsmDiagnosticHandler(
-    LLVMContextRef C, LLVMContext::InlineAsmDiagHandlerTy H, void *CX) {
+    LLVMContextRef C, LLVMInlineAsmDiagHandlerTy H, void *CX) {
+  // Diagnostic handlers were unified in LLVM change 5de2d189e6ad, so starting
+  // with LLVM 13 this function is gone.
+#if LLVM_VERSION_LT(13, 0)
   unwrap(C)->setInlineAsmDiagnosticHandler(H, CX);
+#endif
 }
 
 extern "C" bool LLVMRustUnpackSMDiagnostic(LLVMSMDiagnosticRef DRef,
@@ -1441,47 +1412,28 @@ extern "C" LLVMValueRef LLVMRustBuildMemCpy(LLVMBuilderRef B,
                                             LLVMValueRef Dst, unsigned DstAlign,
                                             LLVMValueRef Src, unsigned SrcAlign,
                                             LLVMValueRef Size, bool IsVolatile) {
-#if LLVM_VERSION_GE(10, 0)
   return wrap(unwrap(B)->CreateMemCpy(
       unwrap(Dst), MaybeAlign(DstAlign),
       unwrap(Src), MaybeAlign(SrcAlign),
       unwrap(Size), IsVolatile));
-#else
-  return wrap(unwrap(B)->CreateMemCpy(
-      unwrap(Dst), DstAlign,
-      unwrap(Src), SrcAlign,
-      unwrap(Size), IsVolatile));
-#endif
 }
 
 extern "C" LLVMValueRef LLVMRustBuildMemMove(LLVMBuilderRef B,
                                              LLVMValueRef Dst, unsigned DstAlign,
                                              LLVMValueRef Src, unsigned SrcAlign,
                                              LLVMValueRef Size, bool IsVolatile) {
-#if LLVM_VERSION_GE(10, 0)
   return wrap(unwrap(B)->CreateMemMove(
       unwrap(Dst), MaybeAlign(DstAlign),
       unwrap(Src), MaybeAlign(SrcAlign),
       unwrap(Size), IsVolatile));
-#else
-  return wrap(unwrap(B)->CreateMemMove(
-      unwrap(Dst), DstAlign,
-      unwrap(Src), SrcAlign,
-      unwrap(Size), IsVolatile));
-#endif
 }
 
 extern "C" LLVMValueRef LLVMRustBuildMemSet(LLVMBuilderRef B,
                                             LLVMValueRef Dst, unsigned DstAlign,
                                             LLVMValueRef Val,
                                             LLVMValueRef Size, bool IsVolatile) {
-#if LLVM_VERSION_GE(10, 0)
   return wrap(unwrap(B)->CreateMemSet(
       unwrap(Dst), unwrap(Val), unwrap(Size), MaybeAlign(DstAlign), IsVolatile));
-#else
-  return wrap(unwrap(B)->CreateMemSet(
-      unwrap(Dst), unwrap(Val), unwrap(Size), DstAlign, IsVolatile));
-#endif
 }
 
 extern "C" LLVMValueRef
@@ -1661,17 +1613,17 @@ extern "C" void LLVMRustSetVisibility(LLVMValueRef V,
   LLVMSetVisibility(V, fromRust(RustVisibility));
 }
 
+extern "C" void LLVMRustSetDSOLocal(LLVMValueRef Global, bool is_dso_local) {
+  unwrap<GlobalValue>(Global)->setDSOLocal(is_dso_local);
+}
+
 struct LLVMRustModuleBuffer {
   std::string data;
 };
 
 extern "C" LLVMRustModuleBuffer*
 LLVMRustModuleBufferCreate(LLVMModuleRef M) {
-#if LLVM_VERSION_GE(10, 0)
   auto Ret = std::make_unique<LLVMRustModuleBuffer>();
-#else
-  auto Ret = llvm::make_unique<LLVMRustModuleBuffer>();
-#endif
   {
     raw_string_ostream OS(Ret->data);
     {
@@ -1769,4 +1721,55 @@ LLVMRustBuildMinNum(LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS) {
 extern "C" LLVMValueRef
 LLVMRustBuildMaxNum(LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS) {
     return wrap(unwrap(B)->CreateMaxNum(unwrap(LHS),unwrap(RHS)));
+}
+
+// This struct contains all necessary info about a symbol exported from a DLL.
+// At the moment, it's just the symbol's name, but we use a separate struct to
+// make it easier to add other information like ordinal later.
+struct LLVMRustCOFFShortExport {
+  const char* name;
+};
+
+// Machine must be a COFF machine type, as defined in PE specs.
+extern "C" LLVMRustResult LLVMRustWriteImportLibrary(
+  const char* ImportName,
+  const char* Path,
+  const LLVMRustCOFFShortExport* Exports,
+  size_t NumExports,
+  uint16_t Machine,
+  bool MinGW)
+{
+  std::vector<llvm::object::COFFShortExport> ConvertedExports;
+  ConvertedExports.reserve(NumExports);
+
+  for (size_t i = 0; i < NumExports; ++i) {
+    ConvertedExports.push_back(llvm::object::COFFShortExport{
+      Exports[i].name,  // Name
+      std::string{},    // ExtName
+      std::string{},    // SymbolName
+      std::string{},    // AliasTarget
+      0,                // Ordinal
+      false,            // Noname
+      false,            // Data
+      false,            // Private
+      false             // Constant
+    });
+  }
+
+  auto Error = llvm::object::writeImportLibrary(
+    ImportName,
+    Path,
+    ConvertedExports,
+    static_cast<llvm::COFF::MachineTypes>(Machine),
+    MinGW);
+  if (Error) {
+    std::string errorString;
+    llvm::raw_string_ostream stream(errorString);
+    stream << Error;
+    stream.flush();
+    LLVMRustSetLastError(errorString.c_str());
+    return LLVMRustResult::Failure;
+  } else {
+    return LLVMRustResult::Success;
+  }
 }

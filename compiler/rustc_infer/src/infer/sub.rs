@@ -62,6 +62,7 @@ impl TypeRelation<'tcx> for Sub<'combine, 'infcx, 'tcx> {
     fn relate_with_variance<T: Relate<'tcx>>(
         &mut self,
         variance: ty::Variance,
+        _info: ty::VarianceDiagInfo<'tcx>,
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
@@ -162,9 +163,9 @@ impl TypeRelation<'tcx> for Sub<'combine, 'infcx, 'tcx> {
 
     fn binders<T>(
         &mut self,
-        a: ty::Binder<T>,
-        b: ty::Binder<T>,
-    ) -> RelateResult<'tcx, ty::Binder<T>>
+        a: ty::Binder<'tcx, T>,
+        b: ty::Binder<'tcx, T>,
+    ) -> RelateResult<'tcx, ty::Binder<'tcx, T>>
     where
         T: Relate<'tcx>,
     {

@@ -6,7 +6,7 @@ use crate::astconv::AstConv as _;
 use crate::check::cast;
 use crate::check::coercion::CoerceMany;
 use crate::check::fatally_break_rust;
-use crate::check::method::{probe, MethodError, SelfSource};
+use crate::check::method::SelfSource;
 use crate::check::report_unexpected_variant_res;
 use crate::check::BreakableCtxt;
 use crate::check::Diverges;
@@ -30,7 +30,6 @@ use rustc_errors::{pluralize, struct_span_err, Applicability, DiagnosticBuilder,
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::lang_items::LangItem;
 use rustc_hir::{ExprKind, QPath};
 use rustc_infer::infer;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
@@ -162,7 +161,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &'tcx hir::Expr<'tcx>,
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
-        debug!(">> type-checking: expr={:?} expected={:?}", expr, expected);
+        debug!(">> type-checking: expected={:?}, expr={:?} ", expected, expr);
 
         // True if `expr` is a `Try::from_ok(())` that is a result of desugaring a try block
         // without the final expr (e.g. `try { return; }`). We don't want to generate an
@@ -225,7 +224,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &'tcx hir::Expr<'tcx>,
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
-        debug!("check_expr_kind(expr={:?}, expected={:?})", expr, expected);
+        debug!("check_expr_kind(expected={:?}, expr={:?})", expected, expr);
 
         let tcx = self.tcx;
         match expr.kind {
@@ -461,9 +460,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.resolve_lang_item_path(lang_item, expr.span, expr.hir_id).1
     }
 
-    fn check_expr_path(&self, qpath: &hir::QPath<'_>, expr: &'tcx hir::Expr<'tcx>) -> Ty<'tcx> {
+    fn check_expr_path(
+        &self,
+        qpath: &'tcx hir::QPath<'tcx>,
+        expr: &'tcx hir::Expr<'tcx>,
+    ) -> Ty<'tcx> {
         let tcx = self.tcx;
-        let (res, opt_ty, segs) = self.resolve_ty_and_res_ufcs(qpath, expr.hir_id, expr.span);
+        let (res, opt_ty, segs) =
+            self.resolve_ty_and_res_fully_qualified_call(qpath, expr.hir_id, expr.span);
         let ty = match res {
             Res::Err => {
                 self.set_tainted_by_errors();
@@ -600,7 +604,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         &cause,
                         &mut |mut err| {
                             self.suggest_mismatched_types_on_tail(
-                                &mut err, expr, ty, e_ty, cause.span, target_id,
+                                &mut err, expr, ty, e_ty, target_id,
                             );
                             if let Some(val) = ty_kind_suggestion(ty) {
                                 let label = destination
@@ -671,7 +675,53 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &'tcx hir::Expr<'tcx>,
     ) -> Ty<'tcx> {
         if self.ret_coercion.is_none() {
-            self.tcx.sess.emit_err(ReturnStmtOutsideOfFnBody { span: expr.span });
+            let mut err = ReturnStmtOutsideOfFnBody {
+                span: expr.span,
+                encl_body_span: None,
+                encl_fn_span: None,
+            };
+
+            let encl_item_id = self.tcx.hir().get_parent_item(expr.hir_id);
+
+            if let Some(hir::Node::Item(hir::Item {
+                kind: hir::ItemKind::Fn(..),
+                span: encl_fn_span,
+                ..
+            }))
+            | Some(hir::Node::TraitItem(hir::TraitItem {
+                kind: hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)),
+                span: encl_fn_span,
+                ..
+            }))
+            | Some(hir::Node::ImplItem(hir::ImplItem {
+                kind: hir::ImplItemKind::Fn(..),
+                span: encl_fn_span,
+                ..
+            })) = self.tcx.hir().find(encl_item_id)
+            {
+                // We are inside a function body, so reporting "return statement
+                // outside of function body" needs an explanation.
+
+                let encl_body_owner_id = self.tcx.hir().enclosing_body_owner(expr.hir_id);
+
+                // If this didn't hold, we would not have to report an error in
+                // the first place.
+                assert_ne!(encl_item_id, encl_body_owner_id);
+
+                let encl_body_id = self.tcx.hir().body_owned_by(encl_body_owner_id);
+                let encl_body = self.tcx.hir().body(encl_body_id);
+
+                err.encl_body_span = Some(encl_body.value.span);
+                err.encl_fn_span = Some(*encl_fn_span);
+            }
+
+            self.tcx.sess.emit_err(err);
+
+            if let Some(e) = expr_opt {
+                // We still have to type-check `e` (issue #86188), but calling
+                // `check_return_expr` only works inside fn bodies.
+                self.check_expr(e);
+            }
         } else if let Some(e) = expr_opt {
             if self.ret_coercion_span.get().is_none() {
                 self.ret_coercion_span.set(Some(e.span));
@@ -937,7 +987,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // no need to check for bot/err -- callee does that
         let rcvr_t = self.structurally_resolved_type(args[0].span, rcvr_t);
 
-        let method = match self.lookup_method(rcvr_t, segment, span, expr, rcvr) {
+        let method = match self.lookup_method(rcvr_t, segment, span, expr, rcvr, args) {
             Ok(method) => {
                 // We could add a "consider `foo::<params>`" suggestion here, but I wasn't able to
                 // trigger this codepath causing `structuraly_resolved_type` to emit an error.
@@ -947,7 +997,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             Err(error) => {
                 if segment.ident.name != kw::Empty {
-                    self.report_extended_method_error(segment, span, args, rcvr_t, error);
+                    if let Some(mut err) = self.report_method_error(
+                        span,
+                        rcvr_t,
+                        segment.ident,
+                        SelfSource::MethodCall(&args[0]),
+                        error,
+                        Some(args),
+                    ) {
+                        err.emit();
+                    }
                 }
                 Err(())
             }
@@ -962,59 +1021,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             DontTupleArguments,
             expected,
         )
-    }
-
-    fn report_extended_method_error(
-        &self,
-        segment: &hir::PathSegment<'_>,
-        span: Span,
-        args: &'tcx [hir::Expr<'tcx>],
-        rcvr_t: Ty<'tcx>,
-        error: MethodError<'tcx>,
-    ) {
-        let rcvr = &args[0];
-        let try_alt_rcvr = |err: &mut DiagnosticBuilder<'_>, new_rcvr_t| {
-            if let Some(new_rcvr_t) = new_rcvr_t {
-                if let Ok(pick) = self.lookup_probe(
-                    span,
-                    segment.ident,
-                    new_rcvr_t,
-                    rcvr,
-                    probe::ProbeScope::AllTraits,
-                ) {
-                    debug!("try_alt_rcvr: pick candidate {:?}", pick);
-                    // Make sure the method is defined for the *actual* receiver:
-                    // we don't want to treat `Box<Self>` as a receiver if
-                    // it only works because of an autoderef to `&self`
-                    if pick.autoderefs == 0 {
-                        err.span_label(
-                            pick.item.ident.span,
-                            &format!("the method is available for `{}` here", new_rcvr_t),
-                        );
-                    }
-                }
-            }
-        };
-
-        if let Some(mut err) = self.report_method_error(
-            span,
-            rcvr_t,
-            segment.ident,
-            SelfSource::MethodCall(rcvr),
-            error,
-            Some(args),
-        ) {
-            if let ty::Adt(..) = rcvr_t.kind() {
-                // Try alternative arbitrary self types that could fulfill this call.
-                // FIXME: probe for all types that *could* be arbitrary self-types, not
-                // just this list.
-                try_alt_rcvr(&mut err, self.tcx.mk_lang_item(rcvr_t, LangItem::OwnedBox));
-                try_alt_rcvr(&mut err, self.tcx.mk_lang_item(rcvr_t, LangItem::Pin));
-                try_alt_rcvr(&mut err, self.tcx.mk_diagnostic_item(rcvr_t, sym::Arc));
-                try_alt_rcvr(&mut err, self.tcx.mk_diagnostic_item(rcvr_t, sym::Rc));
-            }
-            err.emit();
-        }
     }
 
     fn check_expr_cast(
@@ -1158,7 +1164,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &hir::Expr<'_>,
         expected: Expectation<'tcx>,
         qpath: &QPath<'_>,
-        fields: &'tcx [hir::Field<'tcx>],
+        fields: &'tcx [hir::ExprField<'tcx>],
         base_expr: &'tcx Option<&'tcx hir::Expr<'tcx>>,
     ) -> Ty<'tcx> {
         // Find the relevant variant
@@ -1231,7 +1237,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr_id: hir::HirId,
         span: Span,
         variant: &'tcx ty::VariantDef,
-        ast_fields: &'tcx [hir::Field<'tcx>],
+        ast_fields: &'tcx [hir::ExprField<'tcx>],
         check_completeness: bool,
     ) -> bool {
         let tcx = self.tcx;
@@ -1271,7 +1277,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // struct-like enums (yet...), but it's definitely not
                 // a bug to have constructed one.
                 if adt_kind != AdtKind::Enum {
-                    tcx.check_stability(v_field.did, Some(expr_id), field.span);
+                    tcx.check_stability(v_field.did, Some(expr_id), field.span, None);
                 }
 
                 self.field_ty(field.span, v_field, substs)
@@ -1320,7 +1326,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     fn check_struct_fields_on_error(
         &self,
-        fields: &'tcx [hir::Field<'tcx>],
+        fields: &'tcx [hir::ExprField<'tcx>],
         base_expr: &'tcx Option<&'tcx hir::Expr<'tcx>>,
     ) {
         for field in fields {
@@ -1411,8 +1417,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         ty: Ty<'tcx>,
         variant: &'tcx ty::VariantDef,
-        field: &hir::Field<'_>,
-        skip_fields: &[hir::Field<'_>],
+        field: &hir::ExprField<'_>,
+        skip_fields: &[hir::ExprField<'_>],
         kind_name: &str,
         ty_span: Span,
     ) {
@@ -1612,7 +1618,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             self.apply_adjustments(base, adjustments);
                             self.register_predicates(autoderef.into_obligations());
 
-                            self.tcx.check_stability(field.did, Some(expr.hir_id), expr.span);
+                            self.tcx.check_stability(field.did, Some(expr.hir_id), expr.span, None);
                             return field_ty;
                         }
                         private_candidate = Some((base_def.did, field_ty));
@@ -2128,7 +2134,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn check_expr_asm(&self, asm: &'tcx hir::InlineAsm<'tcx>) -> Ty<'tcx> {
         for (op, _op_sp) in asm.operands {
             match op {
-                hir::InlineAsmOperand::In { expr, .. } | hir::InlineAsmOperand::Const { expr } => {
+                hir::InlineAsmOperand::In { expr, .. } => {
                     self.check_expr_asm_operand(expr, true);
                 }
                 hir::InlineAsmOperand::Out { expr, .. } => {
@@ -2144,6 +2150,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     if let Some(out_expr) = out_expr {
                         self.check_expr_asm_operand(out_expr, false);
                     }
+                }
+                hir::InlineAsmOperand::Const { anon_const } => {
+                    self.to_const(anon_const);
                 }
                 hir::InlineAsmOperand::Sym { expr } => {
                     self.check_expr(expr);

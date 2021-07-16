@@ -13,12 +13,8 @@
 
 #![no_std]
 #![unstable(feature = "panic_unwind", issue = "32837")]
-#![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/",
-    issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/"
-)]
+#![doc(issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/")]
 #![feature(core_intrinsics)]
-#![feature(int_bits_const)]
 #![feature(lang_items)]
 #![feature(nll)]
 #![feature(panic_unwind)]
@@ -27,7 +23,6 @@
 #![feature(unwind_attributes)]
 #![feature(abi_thiscall)]
 #![feature(rustc_attrs)]
-#![feature(raw)]
 #![panic_runtime]
 #![feature(panic_runtime)]
 // `real_imp` is unused with Miri, so silence warnings.

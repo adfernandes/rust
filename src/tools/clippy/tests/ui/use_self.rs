@@ -75,13 +75,13 @@ mod lifetimes {
 
 mod issue2894 {
     trait IntoBytes {
-        fn to_bytes(&self) -> Vec<u8>;
+        fn to_bytes(self) -> Vec<u8>;
     }
 
     // This should not be linted
     impl IntoBytes for u8 {
-        fn to_bytes(&self) -> Vec<u8> {
-            vec![*self]
+        fn to_bytes(self) -> Vec<u8> {
+            vec![self]
         }
     }
 }
@@ -279,7 +279,7 @@ mod generics {
     impl<T> Foo<T> {
         // `Self` is applicable here
         fn foo(value: T) -> Foo<T> {
-            Foo { value }
+            Foo::<T> { value }
         }
 
         // `Cannot` use `Self` as a return type as the generic types are different
@@ -312,17 +312,18 @@ mod issue4140 {
         fn try_from(value: T) -> Result<Self, Error<Self::From, Self::To>>;
     }
 
-    impl<F, T> TryFrom<F> for T
-    where
-        T: From<F>,
-    {
-        type From = T::From;
-        type To = T::To;
+    // FIXME: Suggested fix results in infinite recursion.
+    // impl<F, T> TryFrom<F> for T
+    // where
+    //     T: From<F>,
+    // {
+    //     type From = Self::From;
+    //     type To = Self::To;
 
-        fn try_from(value: F) -> Result<Self, Error<Self::From, Self::To>> {
-            Ok(From::from(value))
-        }
-    }
+    //     fn try_from(value: F) -> Result<Self, Error<Self::From, Self::To>> {
+    //         Ok(From::from(value))
+    //     }
+    // }
 
     impl From<bool> for i64 {
         type From = bool;
@@ -459,5 +460,58 @@ mod issue6818 {
     #[derive(serde::Deserialize)]
     struct A {
         a: i32,
+    }
+}
+
+mod issue7206 {
+    struct MyStruct<const C: char>;
+    impl From<MyStruct<'a'>> for MyStruct<'b'> {
+        fn from(_s: MyStruct<'a'>) -> Self {
+            Self
+        }
+    }
+
+    // keep linting non-`Const` generic args
+    struct S<'a> {
+        inner: &'a str,
+    }
+
+    struct S2<T> {
+        inner: T,
+    }
+
+    impl<T> S2<T> {
+        fn new() -> Self {
+            unimplemented!();
+        }
+    }
+
+    impl<'a> S2<S<'a>> {
+        fn new_again() -> Self {
+            S2::new()
+        }
+    }
+}
+
+mod self_is_ty_param {
+    trait Trait {
+        type Type;
+        type Hi;
+
+        fn test();
+    }
+
+    impl<I> Trait for I
+    where
+        I: Iterator,
+        I::Item: Trait, // changing this to Self would require <Self as Iterator>
+    {
+        type Type = I;
+        type Hi = I::Item;
+
+        fn test() {
+            let _: I::Item;
+            let _: I; // this could lint, but is questionable
+        }
     }
 }

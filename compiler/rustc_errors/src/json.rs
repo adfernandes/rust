@@ -16,7 +16,7 @@ use crate::registry::Registry;
 use crate::DiagnosticId;
 use crate::ToolMetadata;
 use crate::{CodeSuggestion, SubDiagnostic};
-use rustc_lint_defs::{Applicability, FutureBreakage};
+use rustc_lint_defs::Applicability;
 
 use rustc_data_structures::sync::Lrc;
 use rustc_span::hygiene::ExpnData;
@@ -134,17 +134,14 @@ impl Emitter for JsonEmitter {
         }
     }
 
-    fn emit_future_breakage_report(&mut self, diags: Vec<(FutureBreakage, crate::Diagnostic)>) {
+    fn emit_future_breakage_report(&mut self, diags: Vec<crate::Diagnostic>) {
         let data: Vec<FutureBreakageItem> = diags
             .into_iter()
-            .map(|(breakage, mut diag)| {
+            .map(|mut diag| {
                 if diag.level == crate::Level::Allow {
                     diag.level = crate::Level::Warning;
                 }
-                FutureBreakageItem {
-                    future_breakage_date: breakage.date,
-                    diagnostic: Diagnostic::from_errors_diagnostic(&diag, self),
-                }
+                FutureBreakageItem { diagnostic: Diagnostic::from_errors_diagnostic(&diag, self) }
             })
             .collect();
         let report = FutureIncompatReport { future_incompat_report: data };
@@ -156,6 +153,19 @@ impl Emitter for JsonEmitter {
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
             panic!("failed to print future breakage report: {:?}", e);
+        }
+    }
+
+    fn emit_unused_externs(&mut self, lint_level: &str, unused_externs: &[&str]) {
+        let data = UnusedExterns { lint_level, unused_extern_names: unused_externs };
+        let result = if self.pretty {
+            writeln!(&mut self.dst, "{}", as_pretty_json(&data))
+        } else {
+            writeln!(&mut self.dst, "{}", as_json(&data))
+        }
+        .and_then(|_| self.dst.flush());
+        if let Err(e) = result {
+            panic!("failed to print unused externs: {:?}", e);
         }
     }
 
@@ -203,7 +213,7 @@ macro_rules! encode_fields {
             $(
                 $enc.emit_struct_field(
                     stringify!($name),
-                    idx,
+                    idx == 0,
                     |enc| $name.encode(enc),
                 )?;
                 idx += 1;
@@ -216,7 +226,7 @@ macro_rules! encode_fields {
 // Special-case encoder to skip tool_metadata if not set
 impl<E: Encoder> Encodable<E> for Diagnostic {
     fn encode(&self, s: &mut E) -> Result<(), E::Error> {
-        s.emit_struct("diagnostic", 7, |s| {
+        s.emit_struct(false, |s| {
             let mut idx = 0;
 
             idx = encode_fields!(
@@ -313,13 +323,24 @@ struct ArtifactNotification<'a> {
 
 #[derive(Encodable)]
 struct FutureBreakageItem {
-    future_breakage_date: Option<&'static str>,
     diagnostic: Diagnostic,
 }
 
 #[derive(Encodable)]
 struct FutureIncompatReport {
     future_incompat_report: Vec<FutureBreakageItem>,
+}
+
+// NOTE: Keep this in sync with the equivalent structs in rustdoc's
+// doctest component (as well as cargo).
+// We could unify this struct the one in rustdoc but they have different
+// ownership semantics, so doing so would create wasteful allocations.
+#[derive(Encodable)]
+struct UnusedExterns<'a, 'b, 'c> {
+    /// The severity level of the unused dependencies lint
+    lint_level: &'a str,
+    /// List of unused externs by their names.
+    unused_extern_names: &'b [&'c str],
 }
 
 impl Diagnostic {
@@ -443,7 +464,7 @@ impl DiagnosticSpan {
         });
 
         DiagnosticSpan {
-            file_name: start.file.name.to_string(),
+            file_name: start.file.name.prefer_local().to_string(),
             byte_start: start.file.original_relative_byte_pos(span.lo()).0,
             byte_end: start.file.original_relative_byte_pos(span.hi()).0,
             line_start: start.line,
@@ -493,7 +514,7 @@ impl DiagnosticSpanLine {
         h_end: usize,
     ) -> DiagnosticSpanLine {
         DiagnosticSpanLine {
-            text: sf.get_line(index).map_or(String::new(), |l| l.into_owned()),
+            text: sf.get_line(index).map_or_else(String::new, |l| l.into_owned()),
             highlight_start: h_start,
             highlight_end: h_end,
         }
@@ -534,7 +555,7 @@ impl DiagnosticCode {
         s.map(|s| {
             let s = match s {
                 DiagnosticId::Error(s) => s,
-                DiagnosticId::Lint { name, has_future_breakage: _ } => name,
+                DiagnosticId::Lint { name, .. } => name,
             };
             let je_result =
                 je.registry.as_ref().map(|registry| registry.try_find_description(&s)).unwrap();

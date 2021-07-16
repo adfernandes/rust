@@ -7,15 +7,16 @@ use rustc_hir::lang_items::LangItem;
 pub mod collector;
 pub mod partitioning;
 pub mod polymorphize;
+pub mod util;
 
-pub fn custom_coerce_unsize_info<'tcx>(
+fn custom_coerce_unsize_info<'tcx>(
     tcx: TyCtxt<'tcx>,
     source_ty: Ty<'tcx>,
     target_ty: Ty<'tcx>,
 ) -> CustomCoerceUnsized {
     let def_id = tcx.require_lang_item(LangItem::CoerceUnsized, None);
 
-    let trait_ref = ty::Binder::bind(ty::TraitRef {
+    let trait_ref = ty::Binder::dummy(ty::TraitRef {
         def_id,
         substs: tcx.mk_substs_trait(source_ty, &[target_ty.into()]),
     });

@@ -33,11 +33,9 @@
 #![feature(box_patterns)]
 #![feature(crate_visibility_modifier)]
 #![feature(iter_order_by)]
+#![feature(iter_zip)]
 #![feature(never_type)]
 #![feature(nll)]
-#![feature(or_patterns)]
-#![feature(half_open_range_patterns)]
-#![feature(exclusive_range_pattern)]
 #![feature(control_flow_enum)]
 #![recursion_limit = "256"]
 
@@ -165,7 +163,7 @@ macro_rules! late_lint_passes {
                 // FIXME: Turn the computation of types which implement Debug into a query
                 // and change this to a module lint pass
                 MissingDebugImplementations: MissingDebugImplementations::default(),
-                ArrayIntoIter: ArrayIntoIter,
+                ArrayIntoIter: ArrayIntoIter::default(),
                 ClashingExternDeclarations: ClashingExternDeclarations::new(),
                 DropTraitConstraints: DropTraitConstraints,
                 TemporaryCStringAsPtr: TemporaryCStringAsPtr,
@@ -205,6 +203,7 @@ macro_rules! late_lint_mod_passes {
                 UnreachablePub: UnreachablePub,
                 ExplicitOutlivesRequirements: ExplicitOutlivesRequirements,
                 InvalidValue: InvalidValue,
+                DerefNullPtr: DerefNullPtr,
             ]
         );
     };
@@ -325,6 +324,10 @@ fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
     store.register_renamed("exceeding_bitshifts", "arithmetic_overflow");
     store.register_renamed("redundant_semicolon", "redundant_semicolons");
     store.register_renamed("overlapping_patterns", "overlapping_range_endpoints");
+    store.register_renamed("safe_packed_borrows", "unaligned_references");
+    store.register_renamed("disjoint_capture_migration", "rust_2021_incompatible_closure_captures");
+    store.register_renamed("or_patterns_back_compat", "rust_2021_incompatible_or_patterns");
+    store.register_renamed("non_fmt_panic", "non_fmt_panics");
 
     // These were moved to tool lints, but rustc still sees them when compiling normally, before
     // tool lints are registered, so `check_tool_name_for_backwards_compat` doesn't work. Use
@@ -340,7 +343,7 @@ fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
         "non_autolinks",
     ];
     for rustdoc_lint in RUSTDOC_LINTS {
-        store.register_removed(rustdoc_lint, &format!("use `rustdoc::{}` instead", rustdoc_lint));
+        store.register_ignored(rustdoc_lint);
     }
     store.register_removed(
         "intra_doc_link_resolution_failure",
@@ -472,10 +475,10 @@ fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
 }
 
 fn register_internals(store: &mut LintStore) {
-    store.register_lints(&DefaultHashTypes::get_lints());
-    store.register_early_pass(|| box DefaultHashTypes::new());
     store.register_lints(&LintPassImpl::get_lints());
     store.register_early_pass(|| box LintPassImpl);
+    store.register_lints(&DefaultHashTypes::get_lints());
+    store.register_late_pass(|| box DefaultHashTypes);
     store.register_lints(&ExistingDocKeyword::get_lints());
     store.register_late_pass(|| box ExistingDocKeyword);
     store.register_lints(&TyTyKind::get_lints());
@@ -494,3 +497,6 @@ fn register_internals(store: &mut LintStore) {
         ],
     );
 }
+
+#[cfg(test)]
+mod tests;

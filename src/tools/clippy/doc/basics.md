@@ -28,6 +28,8 @@ git clone git@github.com:<your-username>/rust-clippy
 If you've already cloned Clippy in the past, update it to the latest version:
 
 ```bash
+# If the upstream remote has not been added yet
+git remote add upstream https://github.com/rust-lang/rust-clippy
 # upstream has to be the remote of the rust-lang/rust-clippy repo
 git fetch upstream
 # make sure that you are on the master branch
@@ -88,15 +90,17 @@ cargo dev fmt
 cargo dev update_lints
 # create a new lint and register it
 cargo dev new_lint
-# (experimental) Setup Clippy to work with rust-analyzer
-cargo dev ra_setup
+# automatically formatting all code before each commit
+cargo dev setup git-hook
+# (experimental) Setup Clippy to work with IntelliJ-Rust
+cargo dev setup intellij
 ```
 
 ## lintcheck
 `cargo lintcheck` will build and run clippy on a fixed set of crates and generate a log of the results.  
-You can `git diff` the updated log against its previous version and 
+You can `git diff` the updated log against its previous version and
 see what impact your lint made on a small set of crates.  
-If you add a new lint, please audit the resulting warnings and make sure 
+If you add a new lint, please audit the resulting warnings and make sure
 there are no false positives and that the suggestions are valid.
 
 Refer to the tools [README] for more details.

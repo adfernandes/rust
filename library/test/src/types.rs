@@ -112,14 +112,20 @@ impl fmt::Debug for TestFn {
     }
 }
 
+// A unique integer associated with each test.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TestId(pub usize);
+
 // The definition of a single test. A test runner will run a list of
 // these.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct TestDesc {
     pub name: TestName,
     pub ignore: bool,
     pub should_panic: options::ShouldPanic,
     pub allow_fail: bool,
+    pub compile_fail: bool,
+    pub no_run: bool,
     pub test_type: TestType,
 }
 
@@ -135,6 +141,30 @@ impl TestDesc {
                 name
             }
         }
+    }
+
+    /// Returns None for ignored test or that that are just run, otherwise give a description of the type of test.
+    /// Descriptions include "should panic", "compile fail" and "compile".
+    pub fn test_mode(&self) -> Option<&'static str> {
+        if self.ignore {
+            return None;
+        }
+        match self.should_panic {
+            options::ShouldPanic::Yes | options::ShouldPanic::YesWithMessage(_) => {
+                return Some("should panic");
+            }
+            options::ShouldPanic::No => {}
+        }
+        if self.allow_fail {
+            return Some("allow fail");
+        }
+        if self.compile_fail {
+            return Some("compile fail");
+        }
+        if self.no_run {
+            return Some("compile");
+        }
+        None
     }
 }
 

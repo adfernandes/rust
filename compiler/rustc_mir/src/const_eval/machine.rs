@@ -17,7 +17,7 @@ use rustc_target::spec::abi::Abi;
 
 use crate::interpret::{
     self, compile_time_machine, AllocId, Allocation, Frame, ImmTy, InterpCx, InterpResult, Memory,
-    OpTy, PlaceTy, Pointer, Scalar,
+    OpTy, PlaceTy, Pointer, Scalar, StackPopUnwind,
 };
 
 use super::error::*;
@@ -53,7 +53,7 @@ impl<'mir, 'tcx> InterpCx<'mir, 'tcx, CompileTimeInterpreter<'mir, 'tcx>> {
 /// Extra machine state for CTFE, and the Machine instance
 pub struct CompileTimeInterpreter<'mir, 'tcx> {
     /// For now, the number of terminators that can be evaluated before we throw a resource
-    /// exhuastion error.
+    /// exhaustion error.
     ///
     /// Setting this to `0` disables the limit and allows the interpreter to run forever.
     pub steps_remaining: usize,
@@ -201,6 +201,8 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
 
     type MemoryExtra = MemoryExtra;
 
+    const PANIC_ON_ALLOC_FAIL: bool = false; // will be raised as a proper error
+
     fn load_mir(
         ecx: &InterpCx<'mir, 'tcx, Self>,
         instance: ty::InstanceDef<'tcx>,
@@ -223,7 +225,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         _abi: Abi,
         args: &[OpTy<'tcx>],
         _ret: Option<(&PlaceTy<'tcx>, mir::BasicBlock)>,
-        _unwind: Option<mir::BasicBlock>, // unwinding is not supported in consts
+        _unwind: StackPopUnwind, // unwinding is not supported in consts
     ) -> InterpResult<'tcx, Option<&'mir mir::Body<'tcx>>> {
         debug!("find_mir_or_eval_fn: {:?}", instance);
 
@@ -233,12 +235,15 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
             // sensitive check here.  But we can at least rule out functions that are not const
             // at all.
             if !ecx.tcx.is_const_fn_raw(def.did) {
-                // Some functions we support even if they are non-const -- but avoid testing
-                // that for const fn!
-                ecx.hook_panic_fn(instance, args)?;
-                // We certainly do *not* want to actually call the fn
-                // though, so be sure we return here.
-                throw_unsup_format!("calling non-const function `{}`", instance)
+                // allow calling functions marked with #[default_method_body_is_const].
+                if !ecx.tcx.has_attr(def.did, sym::default_method_body_is_const) {
+                    // Some functions we support even if they are non-const -- but avoid testing
+                    // that for const fn!
+                    ecx.hook_panic_fn(instance, args)?;
+                    // We certainly do *not* want to actually call the fn
+                    // though, so be sure we return here.
+                    throw_unsup_format!("calling non-const function `{}`", instance)
+                }
             }
         }
         // This is a const fn. Call it.
@@ -263,7 +268,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx>],
         ret: Option<(&PlaceTy<'tcx>, mir::BasicBlock)>,
-        _unwind: Option<mir::BasicBlock>,
+        _unwind: StackPopUnwind,
     ) -> InterpResult<'tcx> {
         // Shared intrinsics.
         if ecx.emulate_intrinsic(instance, args, ret)? {
@@ -306,7 +311,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
                     Size::from_bytes(size as u64),
                     align,
                     interpret::MemoryKind::Machine(MemoryKind::Heap),
-                );
+                )?;
                 ecx.write_scalar(Scalar::Ptr(ptr), dest)?;
             }
             _ => {
@@ -391,7 +396,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         frame: Frame<'mir, 'tcx>,
     ) -> InterpResult<'tcx, Frame<'mir, 'tcx>> {
         // Enforce stack size limit. Add 1 because this is run before the new frame is pushed.
-        if !ecx.tcx.sess.recursion_limit().value_within_limit(ecx.stack().len() + 1) {
+        if !ecx.recursion_limit.value_within_limit(ecx.stack().len() + 1) {
             throw_exhaust!(StackFrameLimitReached)
         } else {
             Ok(frame)

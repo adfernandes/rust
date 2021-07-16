@@ -1,11 +1,12 @@
 //! This module contains `HashStable` implementations for various data types
-//! from librustc_ast in no particular order.
+//! from `rustc_ast` in no particular order.
 
 use crate::ich::StableHashingContext;
 
 use rustc_ast as ast;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_span::{BytePos, NormalizedPos, SourceFile};
+use std::assert::assert_matches;
 
 use smallvec::SmallVec;
 
@@ -45,7 +46,11 @@ impl<'ctx> rustc_ast::HashStableContext for StableHashingContext<'ctx> {
             item.hash_stable(self, hasher);
             style.hash_stable(self, hasher);
             span.hash_stable(self, hasher);
-            tokens.as_ref().expect_none("Tokens should have been removed during lowering!");
+            assert_matches!(
+                tokens.as_ref(),
+                None,
+                "Tokens should have been removed during lowering!"
+            );
         } else {
             unreachable!();
         }
@@ -57,8 +62,6 @@ impl<'a> HashStable<StableHashingContext<'a>> for SourceFile {
         let SourceFile {
             name: _, // We hash the smaller name_hash instead of this
             name_hash,
-            name_was_remapped,
-            unmapped_path: _,
             cnum,
             // Do not hash the source as it is not encoded
             src: _,
@@ -73,7 +76,6 @@ impl<'a> HashStable<StableHashingContext<'a>> for SourceFile {
         } = *self;
 
         (name_hash as u64).hash_stable(hcx, hasher);
-        name_was_remapped.hash_stable(hcx, hasher);
 
         src_hash.hash_stable(hcx, hasher);
 

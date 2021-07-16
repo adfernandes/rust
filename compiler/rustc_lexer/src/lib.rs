@@ -1,13 +1,13 @@
 //! Low-level Rust lexer.
 //!
-//! The idea with `librustc_lexer` is to make a reusable library,
+//! The idea with `rustc_lexer` is to make a reusable library,
 //! by separating out pure lexing and rustc-specific concerns, like spans,
 //! error reporting, and interning.  So, rustc_lexer operates directly on `&str`,
 //! produces simple tokens which are a pair of type-tag and a bit of original text,
 //! and does not report errors, instead storing them as flags on the token.
 //!
 //! Tokens produced by this lexer are not yet ready for parsing the Rust syntax.
-//! For that see [`librustc_parse::lexer`], which converts this basic token stream
+//! For that see [`rustc_parse::lexer`], which converts this basic token stream
 //! into wide tokens used by actual parser.
 //!
 //! The purpose of this crate is to convert raw sources into a labeled sequence
@@ -17,7 +17,7 @@
 //! The main entity of this crate is the [`TokenKind`] enum which represents common
 //! lexeme types.
 //!
-//! [`librustc_parse::lexer`]: ../rustc_parse/lexer/index.html
+//! [`rustc_parse::lexer`]: ../rustc_parse/lexer/index.html
 // We want to be able to build this crate with a stable compiler, so no
 // `#![feature]` attributes should be added.
 
@@ -66,6 +66,13 @@ pub enum TokenKind {
     Ident,
     /// "r#ident"
     RawIdent,
+    /// An unknown prefix like `foo#`, `foo'`, `foo"`. Note that only the
+    /// prefix (`foo`) is included in the token, not the separator (which is
+    /// lexed as its own distinct token). In Rust 2021 and later, reserved
+    /// prefixes are reported as errors; in earlier editions, they result in a
+    /// (allowed by default) lint, and are treated as regular identifier
+    /// tokens.
+    UnknownPrefix,
     /// "12_u8", "1.0e-40", "b"123"". See `LiteralKind` for more details.
     Literal { kind: LiteralKind, suffix_start: usize },
     /// "'a"
@@ -323,7 +330,7 @@ impl Cursor<'_> {
                     let kind = RawStr { n_hashes, err };
                     Literal { kind, suffix_start }
                 }
-                _ => self.ident(),
+                _ => self.ident_or_unknown_prefix(),
             },
 
             // Byte literal, byte string literal, raw byte string literal or identifier.
@@ -358,12 +365,12 @@ impl Cursor<'_> {
                     let kind = RawByteStr { n_hashes, err };
                     Literal { kind, suffix_start }
                 }
-                _ => self.ident(),
+                _ => self.ident_or_unknown_prefix(),
             },
 
             // Identifier (this should be checked after other variant that can
             // start as identifier).
-            c if is_id_start(c) => self.ident(),
+            c if is_id_start(c) => self.ident_or_unknown_prefix(),
 
             // Numeric literal.
             c @ '0'..='9' => {
@@ -487,11 +494,16 @@ impl Cursor<'_> {
         RawIdent
     }
 
-    fn ident(&mut self) -> TokenKind {
+    fn ident_or_unknown_prefix(&mut self) -> TokenKind {
         debug_assert!(is_id_start(self.prev()));
         // Start is already eaten, eat the rest of identifier.
         self.eat_while(is_id_continue);
-        Ident
+        // Known prefixes must have been handled earlier. So if
+        // we see a prefix here, it is definitely a unknown prefix.
+        match self.first() {
+            '#' | '"' | '\'' => UnknownPrefix,
+            _ => Ident,
+        }
     }
 
     fn number(&mut self, first_digit: char) -> LiteralKind {

@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::fmt;
 use std::mem;
 
-use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir::{self as hir, def_id::DefId, definitions::DefPathData};
 use rustc_index::vec::IndexVec;
@@ -14,12 +13,13 @@ use rustc_middle::ty::layout::{self, TyAndLayout};
 use rustc_middle::ty::{
     self, query::TyCtxtAt, subst::SubstsRef, ParamEnv, Ty, TyCtxt, TypeFoldable,
 };
+use rustc_session::Limit;
 use rustc_span::{Pos, Span};
 use rustc_target::abi::{Align, HasDataLayout, LayoutOf, Size, TargetDataLayout};
 
 use super::{
-    Immediate, MPlaceTy, Machine, MemPlace, MemPlaceMeta, Memory, Operand, Place, PlaceTy,
-    ScalarMaybeUninit, StackPopJump,
+    Immediate, MPlaceTy, Machine, MemPlace, MemPlaceMeta, Memory, MemoryKind, Operand, Place,
+    PlaceTy, ScalarMaybeUninit, StackPopJump,
 };
 use crate::transform::validate::equal_up_to_regions;
 use crate::util::storage::AlwaysLiveLocals;
@@ -41,9 +41,8 @@ pub struct InterpCx<'mir, 'tcx, M: Machine<'mir, 'tcx>> {
     /// The virtual memory system.
     pub memory: Memory<'mir, 'tcx, M>,
 
-    /// A cache for deduplicating vtables
-    pub(super) vtables:
-        FxHashMap<(Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>), Pointer<M::PointerTag>>,
+    /// The recursion limit (cached from `tcx.recursion_limit(())`)
+    pub recursion_limit: Limit,
 }
 
 // The Phantomdata exists to prevent this type from being `Send`. If it were sent across a thread
@@ -134,14 +133,25 @@ pub struct FrameInfo<'tcx> {
     pub lint_root: Option<hir::HirId>,
 }
 
-#[derive(Clone, Eq, PartialEq, Debug, HashStable)] // Miri debug-prints these
+/// Unwind information.
+#[derive(Clone, Copy, Eq, PartialEq, Debug, HashStable)]
+pub enum StackPopUnwind {
+    /// The cleanup block.
+    Cleanup(mir::BasicBlock),
+    /// No cleanup needs to be done.
+    Skip,
+    /// Unwinding is not allowed (UB).
+    NotAllowed,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Debug, HashStable)] // Miri debug-prints these
 pub enum StackPopCleanup {
     /// Jump to the next block in the caller, or cause UB if None (that's a function
     /// that may never return). Also store layout of return place so
     /// we can validate it at that layout.
     /// `ret` stores the block we jump to on a normal return, while `unwind`
     /// stores the block used for cleanup during unwinding.
-    Goto { ret: Option<mir::BasicBlock>, unwind: Option<mir::BasicBlock> },
+    Goto { ret: Option<mir::BasicBlock>, unwind: StackPopUnwind },
     /// Just do nothing: Used by Main and for the `box_alloc` hook in miri.
     /// `cleanup` says whether locals are deallocated. Static computation
     /// wants them leaked to intern what they need (and just throw away
@@ -232,6 +242,8 @@ impl<'mir, 'tcx, Tag, Extra> Frame<'mir, 'tcx, Tag, Extra> {
     /// this frame (can happen e.g. during frame initialization, and during unwinding on
     /// frames without cleanup code).
     /// We basically abuse `Result` as `Either`.
+    ///
+    /// Used by priroda.
     pub fn current_loc(&self) -> Result<mir::Location, Span> {
         self.loc
     }
@@ -261,7 +273,13 @@ impl<'tcx> fmt::Display for FrameInfo<'tcx> {
             }
             if !self.span.is_dummy() {
                 let lo = tcx.sess.source_map().lookup_char_pos(self.span.lo());
-                write!(f, " at {}:{}:{}", lo.file.name, lo.line, lo.col.to_usize() + 1)?;
+                write!(
+                    f,
+                    " at {}:{}:{}",
+                    lo.file.name.prefer_local(),
+                    lo.line,
+                    lo.col.to_usize() + 1
+                )?;
             }
             Ok(())
         })
@@ -374,13 +392,17 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             tcx: tcx.at(root_span),
             param_env,
             memory: Memory::new(tcx, memory_extra),
-            vtables: FxHashMap::default(),
+            recursion_limit: tcx.recursion_limit(),
         }
     }
 
     #[inline(always)]
     pub fn cur_span(&self) -> Span {
-        self.stack().last().map_or(self.tcx.span, |f| f.current_span())
+        self.stack()
+            .iter()
+            .rev()
+            .find(|frame| !frame.instance.def.requires_caller_location(*self.tcx))
+            .map_or(self.tcx.span, |f| f.current_span())
     }
 
     #[inline(always)]
@@ -460,11 +482,6 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     }
 
     #[inline]
-    pub fn type_is_sized(&self, ty: Ty<'tcx>) -> bool {
-        ty.is_sized(self.tcx, self.param_env)
-    }
-
-    #[inline]
     pub fn type_is_freeze(&self, ty: Ty<'tcx>) -> bool {
         ty.is_freeze(self.tcx, self.param_env)
     }
@@ -527,6 +544,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         }
     }
 
+    #[inline(always)]
     pub fn layout_of_local(
         &self,
         frame: &Frame<'mir, 'tcx, M::PointerTag, M::FrameExtra>,
@@ -689,7 +707,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             let span = const_.span;
             let const_ =
                 self.subst_from_current_frame_and_normalize_erasing_regions(const_.literal);
-            self.const_to_op(const_, None).map_err(|err| {
+            self.mir_const_to_op(&const_, None).map_err(|err| {
                 // If there was an error, set the span of the current frame to this constant.
                 // Avoiding doing this when evaluation succeeds.
                 self.frame_mut().loc = Err(span);
@@ -742,13 +760,20 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// *Unwind* to the given `target` basic block.
     /// Do *not* use for returning! Use `return_to_block` instead.
     ///
-    /// If `target` is `None`, that indicates the function does not need cleanup during
-    /// unwinding, and we will just keep propagating that upwards.
-    pub fn unwind_to_block(&mut self, target: Option<mir::BasicBlock>) {
+    /// If `target` is `StackPopUnwind::Skip`, that indicates the function does not need cleanup
+    /// during unwinding, and we will just keep propagating that upwards.
+    ///
+    /// If `target` is `StackPopUnwind::NotAllowed`, that indicates the function does not allow
+    /// unwinding, and doing so is UB.
+    pub fn unwind_to_block(&mut self, target: StackPopUnwind) -> InterpResult<'tcx> {
         self.frame_mut().loc = match target {
-            Some(block) => Ok(mir::Location { block, statement_index: 0 }),
-            None => Err(self.frame_mut().body.span),
+            StackPopUnwind::Cleanup(block) => Ok(mir::Location { block, statement_index: 0 }),
+            StackPopUnwind::Skip => Err(self.frame_mut().body.span),
+            StackPopUnwind::NotAllowed => {
+                throw_ub_format!("unwinding past a stack frame that does not allow unwinding")
+            }
         };
+        Ok(())
     }
 
     /// Pops the current frame from the stack, deallocating the
@@ -797,21 +822,20 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             }
         }
 
+        let return_to_block = frame.return_to_block;
+
         // Now where do we jump next?
 
         // Usually we want to clean up (deallocate locals), but in a few rare cases we don't.
         // In that case, we return early. We also avoid validation in that case,
         // because this is CTFE and the final value will be thoroughly validated anyway.
-        let (cleanup, next_block) = match frame.return_to_block {
-            StackPopCleanup::Goto { ret, unwind } => {
-                (true, Some(if unwinding { unwind } else { ret }))
-            }
-            StackPopCleanup::None { cleanup, .. } => (cleanup, None),
+        let cleanup = match return_to_block {
+            StackPopCleanup::Goto { .. } => true,
+            StackPopCleanup::None { cleanup, .. } => cleanup,
         };
 
         if !cleanup {
             assert!(self.stack().is_empty(), "only the topmost frame should ever be leaked");
-            assert!(next_block.is_none(), "tried to skip cleanup when we have a next block!");
             assert!(!unwinding, "tried to skip cleanup during unwinding");
             // Leak the locals, skip validation, skip machine hook.
             return Ok(());
@@ -830,16 +854,20 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         // Normal return, figure out where to jump.
         if unwinding {
             // Follow the unwind edge.
-            let unwind = next_block.expect("Encountered StackPopCleanup::None when unwinding!");
-            self.unwind_to_block(unwind);
+            let unwind = match return_to_block {
+                StackPopCleanup::Goto { unwind, .. } => unwind,
+                StackPopCleanup::None { .. } => {
+                    panic!("Encountered StackPopCleanup::None when unwinding!")
+                }
+            };
+            self.unwind_to_block(unwind)
         } else {
             // Follow the normal return edge.
-            if let Some(ret) = next_block {
-                self.return_to_block(ret)?;
+            match return_to_block {
+                StackPopCleanup::Goto { ret, .. } => self.return_to_block(ret),
+                StackPopCleanup::None { .. } => Ok(()),
             }
         }
-
-        Ok(())
     }
 
     /// Mark a storage as live, killing the previous content.
@@ -872,7 +900,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // due to the local having ZST type.
             let ptr = ptr.assert_ptr();
             trace!("deallocating local: {:?}", self.memory.dump_alloc(ptr.alloc_id));
-            self.memory.deallocate_local(ptr)?;
+            self.memory.deallocate(ptr, None, MemoryKind::Stack)?;
         };
         Ok(())
     }
@@ -903,7 +931,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     #[must_use]
     pub fn generate_stacktrace(&self) -> Vec<FrameInfo<'tcx>> {
         let mut frames = Vec::new();
-        for frame in self.stack().iter().rev() {
+        for frame in self
+            .stack()
+            .iter()
+            .rev()
+            .skip_while(|frame| frame.instance.def.requires_caller_location(*self.tcx))
+        {
             let lint_root = frame.current_source_info().and_then(|source_info| {
                 match &frame.body.source_scopes[source_info.scope].local_data {
                     mir::ClearCrossCrate::Set(data) => Some(data.lint_root),

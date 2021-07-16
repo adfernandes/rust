@@ -29,6 +29,31 @@ pub enum LLVMRustResult {
     Success,
     Failure,
 }
+
+// Rust version of the C struct with the same name in rustc_llvm/llvm-wrapper/RustWrapper.cpp.
+#[repr(C)]
+pub struct LLVMRustCOFFShortExport {
+    pub name: *const c_char,
+}
+
+impl LLVMRustCOFFShortExport {
+    pub fn from_name(name: *const c_char) -> LLVMRustCOFFShortExport {
+        LLVMRustCOFFShortExport { name }
+    }
+}
+
+/// Translation of LLVM's MachineTypes enum, defined in llvm\include\llvm\BinaryFormat\COFF.h.
+///
+/// We include only architectures supported on Windows.
+#[derive(Copy, Clone, PartialEq)]
+#[repr(C)]
+pub enum LLVMMachineType {
+    AMD64 = 0x8664,
+    I386 = 0x14c,
+    ARM64 = 0xaa64,
+    ARM = 0x01c0,
+}
+
 // Consts for the LLVM CallConv type, pre-cast to usize.
 
 /// LLVM CallingConv::ID. Should we wrap this?
@@ -54,7 +79,7 @@ pub enum CallConv {
 }
 
 /// LLVMRustLinkage
-#[derive(PartialEq)]
+#[derive(Copy, Clone, PartialEq)]
 #[repr(C)]
 pub enum Linkage {
     ExternalLinkage = 0,
@@ -72,6 +97,7 @@ pub enum Linkage {
 
 // LLVMRustVisibility
 #[repr(C)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum Visibility {
     Default = 0,
     Hidden = 1,
@@ -188,33 +214,6 @@ pub enum RealPredicate {
     RealULE = 13,
     RealUNE = 14,
     RealPredicateTrue = 15,
-}
-
-impl RealPredicate {
-    pub fn from_generic(realpred: rustc_codegen_ssa::common::RealPredicate) -> Self {
-        match realpred {
-            rustc_codegen_ssa::common::RealPredicate::RealPredicateFalse => {
-                RealPredicate::RealPredicateFalse
-            }
-            rustc_codegen_ssa::common::RealPredicate::RealOEQ => RealPredicate::RealOEQ,
-            rustc_codegen_ssa::common::RealPredicate::RealOGT => RealPredicate::RealOGT,
-            rustc_codegen_ssa::common::RealPredicate::RealOGE => RealPredicate::RealOGE,
-            rustc_codegen_ssa::common::RealPredicate::RealOLT => RealPredicate::RealOLT,
-            rustc_codegen_ssa::common::RealPredicate::RealOLE => RealPredicate::RealOLE,
-            rustc_codegen_ssa::common::RealPredicate::RealONE => RealPredicate::RealONE,
-            rustc_codegen_ssa::common::RealPredicate::RealORD => RealPredicate::RealORD,
-            rustc_codegen_ssa::common::RealPredicate::RealUNO => RealPredicate::RealUNO,
-            rustc_codegen_ssa::common::RealPredicate::RealUEQ => RealPredicate::RealUEQ,
-            rustc_codegen_ssa::common::RealPredicate::RealUGT => RealPredicate::RealUGT,
-            rustc_codegen_ssa::common::RealPredicate::RealUGE => RealPredicate::RealUGE,
-            rustc_codegen_ssa::common::RealPredicate::RealULT => RealPredicate::RealULT,
-            rustc_codegen_ssa::common::RealPredicate::RealULE => RealPredicate::RealULE,
-            rustc_codegen_ssa::common::RealPredicate::RealUNE => RealPredicate::RealUNE,
-            rustc_codegen_ssa::common::RealPredicate::RealPredicateTrue => {
-                RealPredicate::RealPredicateTrue
-            }
-        }
-    }
 }
 
 /// LLVMTypeKind
@@ -609,11 +608,6 @@ extern "C" {
     pub type PassManagerBuilder;
 }
 extern "C" {
-    pub type ObjectFile;
-}
-#[repr(C)]
-pub struct SectionIterator<'a>(InvariantOpaque<'a>);
-extern "C" {
     pub type Pass;
 }
 extern "C" {
@@ -711,7 +705,7 @@ pub mod coverageinfo {
     }
 
     impl CounterMappingRegion {
-        pub fn code_region(
+        crate fn code_region(
             counter: coverage_map::Counter,
             file_id: u32,
             start_line: u32,
@@ -731,7 +725,10 @@ pub mod coverageinfo {
             }
         }
 
-        pub fn expansion_region(
+        // This function might be used in the future; the LLVM API is still evolving, as is coverage
+        // support.
+        #[allow(dead_code)]
+        crate fn expansion_region(
             file_id: u32,
             expanded_file_id: u32,
             start_line: u32,
@@ -751,7 +748,10 @@ pub mod coverageinfo {
             }
         }
 
-        pub fn skipped_region(
+        // This function might be used in the future; the LLVM API is still evolving, as is coverage
+        // support.
+        #[allow(dead_code)]
+        crate fn skipped_region(
             file_id: u32,
             start_line: u32,
             start_col: u32,
@@ -770,7 +770,10 @@ pub mod coverageinfo {
             }
         }
 
-        pub fn gap_region(
+        // This function might be used in the future; the LLVM API is still evolving, as is coverage
+        // support.
+        #[allow(dead_code)]
+        crate fn gap_region(
             counter: coverage_map::Counter,
             file_id: u32,
             start_line: u32,
@@ -1031,6 +1034,7 @@ extern "C" {
     pub fn LLVMSetSection(Global: &Value, Section: *const c_char);
     pub fn LLVMRustGetVisibility(Global: &Value) -> Visibility;
     pub fn LLVMRustSetVisibility(Global: &Value, Viz: Visibility);
+    pub fn LLVMRustSetDSOLocal(Global: &Value, is_dso_local: bool);
     pub fn LLVMGetAlignment(Global: &Value) -> c_uint;
     pub fn LLVMSetAlignment(Global: &Value, Bytes: c_uint);
     pub fn LLVMSetDLLStorageClass(V: &Value, C: DLLStorageClass);
@@ -1051,6 +1055,7 @@ extern "C" {
     pub fn LLVMDeleteGlobal(GlobalVar: &Value);
     pub fn LLVMGetInitializer(GlobalVar: &Value) -> Option<&Value>;
     pub fn LLVMSetInitializer(GlobalVar: &'a Value, ConstantVal: &'a Value);
+    pub fn LLVMIsThreadLocal(GlobalVar: &Value) -> Bool;
     pub fn LLVMSetThreadLocal(GlobalVar: &Value, IsThreadLocal: Bool);
     pub fn LLVMSetThreadLocalMode(GlobalVar: &Value, Mode: ThreadLocalMode);
     pub fn LLVMIsGlobalConstant(GlobalVar: &Value) -> Bool;
@@ -1096,7 +1101,6 @@ extern "C" {
         Fn: &'a Value,
         Name: *const c_char,
     ) -> &'a BasicBlock;
-    pub fn LLVMDeleteBasicBlock(BB: &BasicBlock);
 
     // Operations on instructions
     pub fn LLVMIsAInstruction(Val: &Value) -> Option<&Value>;
@@ -1371,7 +1375,7 @@ extern "C" {
     pub fn LLVMBuildNeg(B: &Builder<'a>, V: &'a Value, Name: *const c_char) -> &'a Value;
     pub fn LLVMBuildFNeg(B: &Builder<'a>, V: &'a Value, Name: *const c_char) -> &'a Value;
     pub fn LLVMBuildNot(B: &Builder<'a>, V: &'a Value, Name: *const c_char) -> &'a Value;
-    pub fn LLVMRustSetHasUnsafeAlgebra(Instr: &Value);
+    pub fn LLVMRustSetFastMath(Instr: &Value);
 
     // Memory
     pub fn LLVMBuildAlloca(B: &Builder<'a>, Ty: &'a Type, Name: *const c_char) -> &'a Value;
@@ -1381,7 +1385,12 @@ extern "C" {
         Val: &'a Value,
         Name: *const c_char,
     ) -> &'a Value;
-    pub fn LLVMBuildLoad(B: &Builder<'a>, PointerVal: &'a Value, Name: *const c_char) -> &'a Value;
+    pub fn LLVMBuildLoad2(
+        B: &Builder<'a>,
+        Ty: &'a Type,
+        PointerVal: &'a Value,
+        Name: *const c_char,
+    ) -> &'a Value;
 
     pub fn LLVMBuildStore(B: &Builder<'a>, Val: &'a Value, Ptr: &'a Value) -> &'a Value;
 
@@ -1627,6 +1636,7 @@ extern "C" {
     // Atomic Operations
     pub fn LLVMRustBuildAtomicLoad(
         B: &Builder<'a>,
+        ElementType: &'a Type,
         PointerVal: &'a Value,
         Name: *const c_char,
         Order: AtomicOrdering,
@@ -1718,35 +1728,6 @@ extern "C" {
     pub fn LLVMGetHostCPUFeatures() -> *mut c_char;
 
     pub fn LLVMDisposeMessage(message: *mut c_char);
-
-    // Stuff that's in llvm-wrapper/ because it's not upstream yet.
-
-    /// Opens an object file.
-    pub fn LLVMCreateObjectFile(
-        MemBuf: &'static mut MemoryBuffer,
-    ) -> Option<&'static mut ObjectFile>;
-    /// Closes an object file.
-    pub fn LLVMDisposeObjectFile(ObjFile: &'static mut ObjectFile);
-
-    /// Enumerates the sections in an object file.
-    pub fn LLVMGetSections(ObjFile: &'a ObjectFile) -> &'a mut SectionIterator<'a>;
-    /// Destroys a section iterator.
-    pub fn LLVMDisposeSectionIterator(SI: &'a mut SectionIterator<'a>);
-    /// Returns `true` if the section iterator is at the end of the section
-    /// list:
-    pub fn LLVMIsSectionIteratorAtEnd(ObjFile: &'a ObjectFile, SI: &SectionIterator<'a>) -> Bool;
-    /// Moves the section iterator to point to the next section.
-    pub fn LLVMMoveToNextSection(SI: &SectionIterator<'_>);
-    /// Returns the current section size.
-    pub fn LLVMGetSectionSize(SI: &SectionIterator<'_>) -> c_ulonglong;
-    /// Returns the current section contents as a string buffer.
-    pub fn LLVMGetSectionContents(SI: &SectionIterator<'_>) -> *const c_char;
-
-    /// Reads the given file and returns it as a memory buffer. Use
-    /// LLVMDisposeMemoryBuffer() to get rid of it.
-    pub fn LLVMRustCreateMemoryBufferWithContentsOfFile(
-        Path: *const c_char,
-    ) -> Option<&'static mut MemoryBuffer>;
 
     pub fn LLVMStartMultithreaded() -> Bool;
 
@@ -2054,7 +2035,7 @@ extern "C" {
 
     pub fn LLVMRustDIBuilderCreateUnionType(
         Builder: &DIBuilder<'a>,
-        Scope: &'a DIScope,
+        Scope: Option<&'a DIScope>,
         Name: *const c_char,
         NameLen: size_t,
         File: &'a DIFile,
@@ -2145,7 +2126,13 @@ extern "C" {
     pub fn LLVMRustHasFeature(T: &TargetMachine, s: *const c_char) -> bool;
 
     pub fn LLVMRustPrintTargetCPUs(T: &TargetMachine);
-    pub fn LLVMRustPrintTargetFeatures(T: &TargetMachine);
+    pub fn LLVMRustGetTargetFeaturesCount(T: &TargetMachine) -> size_t;
+    pub fn LLVMRustGetTargetFeature(
+        T: &TargetMachine,
+        Index: size_t,
+        Feature: &mut *const c_char,
+        Desc: &mut *const c_char,
+    );
 
     pub fn LLVMRustGetHostCPUName(len: *mut usize) -> *const c_char;
     pub fn LLVMRustCreateTargetMachine(
@@ -2214,10 +2201,14 @@ extern "C" {
         SanitizerOptions: Option<&SanitizerOptions>,
         PGOGenPath: *const c_char,
         PGOUsePath: *const c_char,
+        InstrumentCoverage: bool,
+        InstrumentGCOV: bool,
         llvm_selfprofiler: *mut c_void,
         begin_callback: SelfProfileBeforePassCallback,
         end_callback: SelfProfileAfterPassCallback,
-    );
+        ExtraPasses: *const c_char,
+        ExtraPassesLen: size_t,
+    ) -> LLVMRustResult;
     pub fn LLVMRustPrintModule(
         M: &'a Module,
         Output: *const c_char,
@@ -2241,12 +2232,6 @@ extern "C" {
     pub fn LLVMRustArchiveChildFree(ACR: &'a mut ArchiveChild<'a>);
     pub fn LLVMRustArchiveIteratorFree(AIR: &'a mut ArchiveIterator<'a>);
     pub fn LLVMRustDestroyArchive(AR: &'static mut Archive);
-
-    #[allow(improper_ctypes)]
-    pub fn LLVMRustGetSectionName(
-        SI: &SectionIterator<'_>,
-        data: &mut Option<std::ptr::NonNull<c_char>>,
-    ) -> size_t;
 
     #[allow(improper_ctypes)]
     pub fn LLVMRustWriteTwineToString(T: &Twine, s: &RustString);
@@ -2310,6 +2295,15 @@ extern "C" {
         Child: Option<&ArchiveChild<'a>>,
     ) -> &'a mut RustArchiveMember<'a>;
     pub fn LLVMRustArchiveMemberFree(Member: &'a mut RustArchiveMember<'a>);
+
+    pub fn LLVMRustWriteImportLibrary(
+        ImportName: *const c_char,
+        Path: *const c_char,
+        Exports: *const LLVMRustCOFFShortExport,
+        NumExports: usize,
+        Machine: u16,
+        MinGW: bool,
+    ) -> LLVMRustResult;
 
     pub fn LLVMRustSetDataLayoutFromTargetMachine(M: &'a Module, TM: &'a TargetMachine);
 

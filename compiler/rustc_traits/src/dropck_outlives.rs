@@ -75,7 +75,7 @@ fn dropck_outlives<'tcx>(
             // Set used to detect infinite recursion.
             let mut ty_set = FxHashSet::default();
 
-            let mut fulfill_cx = TraitEngine::new(infcx.tcx);
+            let mut fulfill_cx = <dyn TraitEngine<'_>>::new(infcx.tcx);
 
             let cause = ObligationCause::dummy();
             let mut constraints = DtorckConstraint::empty();
@@ -163,7 +163,7 @@ fn dtorck_constraint_for_ty<'tcx>(
 ) -> Result<(), NoSolution> {
     debug!("dtorck_constraint_for_ty({:?}, {:?}, {:?}, {:?})", span, for_ty, depth, ty);
 
-    if !tcx.sess.recursion_limit().value_within_limit(depth) {
+    if !tcx.recursion_limit().value_within_limit(depth) {
         constraints.overflows.push(ty);
         return Ok(());
     }

@@ -142,16 +142,11 @@ impl<'tcx> DumpVisitor<'tcx> {
         let data = CratePreludeData {
             crate_id: GlobalCrateId {
                 name: name.into(),
-                disambiguator: self
-                    .tcx
-                    .sess
-                    .local_crate_disambiguator()
-                    .to_fingerprint()
-                    .as_value(),
+                disambiguator: (self.tcx.sess.local_stable_crate_id().to_u64(), 0),
             },
             crate_root: crate_root.unwrap_or_else(|| "<no source>".to_owned()),
             external_crates: self.save_ctxt.get_external_crates(),
-            span: self.span_from_span(krate.item.span),
+            span: self.span_from_span(krate.item.inner),
         };
 
         self.dumper.crate_prelude(data);
@@ -190,7 +185,7 @@ impl<'tcx> DumpVisitor<'tcx> {
         };
 
         let data = CompilationOptions {
-            directory: self.tcx.sess.working_dir.0.clone(),
+            directory: self.tcx.sess.working_dir.remapped_path_if_available().into(),
             program,
             arguments,
             output: self.save_ctxt.compilation_output(crate_name),
@@ -301,7 +296,7 @@ impl<'tcx> DumpVisitor<'tcx> {
 
     fn process_struct_field_def(
         &mut self,
-        field: &'tcx hir::StructField<'tcx>,
+        field: &'tcx hir::FieldDef<'tcx>,
         parent_id: hir::HirId,
     ) {
         let field_data = self.save_ctxt.get_field_data(field, parent_id);
@@ -320,15 +315,6 @@ impl<'tcx> DumpVisitor<'tcx> {
         for param in generics.params {
             match param.kind {
                 hir::GenericParamKind::Lifetime { .. } => {}
-                hir::GenericParamKind::Type {
-                    synthetic: Some(hir::SyntheticTyParamKind::ImplTrait),
-                    ..
-                } => {
-                    return self
-                        .nest_typeck_results(self.tcx.hir().local_def_id(param.hir_id), |this| {
-                            this.visit_generics(generics)
-                        });
-                }
                 hir::GenericParamKind::Type { .. } => {
                     let param_ss = param.name.ident().span;
                     let name = escape(self.span.snippet(param_ss));
@@ -793,7 +779,7 @@ impl<'tcx> DumpVisitor<'tcx> {
         &mut self,
         ex: &'tcx hir::Expr<'tcx>,
         path: &'tcx hir::QPath<'tcx>,
-        fields: &'tcx [hir::Field<'tcx>],
+        fields: &'tcx [hir::ExprField<'tcx>],
         variant: &'tcx ty::VariantDef,
         rest: Option<&'tcx hir::Expr<'tcx>>,
     ) {
@@ -1106,16 +1092,11 @@ impl<'tcx> DumpVisitor<'tcx> {
             format!("::{}", self.tcx.def_path_str(self.tcx.hir().local_def_id(id).to_def_id()));
 
         let sm = self.tcx.sess.source_map();
-        let filename = sm.span_to_filename(krate.item.span);
+        let filename = sm.span_to_filename(krate.item.inner);
         let data_id = id_from_hir_id(id, &self.save_ctxt);
-        let children = krate
-            .item
-            .module
-            .item_ids
-            .iter()
-            .map(|i| id_from_def_id(i.def_id.to_def_id()))
-            .collect();
-        let span = self.span_from_span(krate.item.span);
+        let children =
+            krate.item.item_ids.iter().map(|i| id_from_def_id(i.def_id.to_def_id())).collect();
+        let span = self.span_from_span(krate.item.inner);
         let attrs = self.tcx.hir().attrs(id);
 
         self.dumper.dump_def(
@@ -1126,7 +1107,7 @@ impl<'tcx> DumpVisitor<'tcx> {
                 name: String::new(),
                 qualname,
                 span,
-                value: filename.to_string(),
+                value: filename.prefer_remapped().to_string(),
                 children,
                 parent: None,
                 decl_id: None,

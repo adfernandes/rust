@@ -42,20 +42,33 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+#[cfg(not(no_global_oom_handling))]
 use core::char::{decode_utf16, REPLACEMENT_CHARACTER};
 use core::fmt;
 use core::hash;
-use core::iter::{FromIterator, FusedIterator};
+#[cfg(not(no_global_oom_handling))]
+use core::iter::FromIterator;
+use core::iter::{from_fn, FusedIterator};
+#[cfg(not(no_global_oom_handling))]
+use core::ops::Add;
+#[cfg(not(no_global_oom_handling))]
+use core::ops::AddAssign;
+#[cfg(not(no_global_oom_handling))]
 use core::ops::Bound::{Excluded, Included, Unbounded};
-use core::ops::{self, Add, AddAssign, Index, IndexMut, Range, RangeBounds};
+use core::ops::{self, Index, IndexMut, Range, RangeBounds};
 use core::ptr;
 use core::slice;
-use core::str::{lossy, pattern::Pattern};
+#[cfg(not(no_global_oom_handling))]
+use core::str::lossy;
+use core::str::pattern::Pattern;
 
+#[cfg(not(no_global_oom_handling))]
 use crate::borrow::{Cow, ToOwned};
 use crate::boxed::Box;
 use crate::collections::TryReserveError;
-use crate::str::{self, from_boxed_utf8_unchecked, Chars, FromStr, Utf8Error};
+use crate::str::{self, Chars, Utf8Error};
+#[cfg(not(no_global_oom_handling))]
+use crate::str::{from_boxed_utf8_unchecked, FromStr};
 use crate::vec::Vec;
 
 /// A UTF-8–encoded, growable string.
@@ -314,7 +327,8 @@ pub struct String {
 /// assert_eq!(vec![0, 159], value.unwrap_err().into_bytes());
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(no_global_oom_handling), derive(Clone))]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FromUtf8Error {
     bytes: Vec<u8>,
     error: Utf8Error,
@@ -360,7 +374,7 @@ impl String {
     /// let s = String::new();
     /// ```
     #[inline]
-    #[rustc_const_stable(feature = "const_string_new", since = "1.32.0")]
+    #[rustc_const_stable(feature = "const_string_new", since = "1.39.0")]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const fn new() -> String {
         String { vec: Vec::new() }
@@ -403,9 +417,8 @@ impl String {
     /// // ...but this may make the string reallocate
     /// s.push('a');
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
-    #[doc(alias = "alloc")]
-    #[doc(alias = "malloc")]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with_capacity(capacity: usize) -> String {
         String { vec: Vec::with_capacity(capacity) }
@@ -535,6 +548,7 @@ impl String {
     ///
     /// assert_eq!("Hello �World", output);
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf8_lossy(v: &[u8]) -> Cow<'_, str> {
         let mut iter = lossy::Utf8Lossy::from_bytes(v).chunks();
@@ -587,6 +601,7 @@ impl String {
     ///           0xD800, 0x0069, 0x0063];
     /// assert!(String::from_utf16(v).is_err());
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf16(v: &[u16]) -> Result<String, FromUtf16Error> {
         // This isn't done via collect::<Result<_, _>>() for performance reasons.
@@ -626,6 +641,7 @@ impl String {
     /// assert_eq!(String::from("𝄞mus\u{FFFD}ic\u{FFFD}"),
     ///            String::from_utf16_lossy(v));
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf16_lossy(v: &[u16]) -> String {
@@ -818,10 +834,47 @@ impl String {
     ///
     /// assert_eq!("foobar", s);
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn push_str(&mut self, string: &str) {
         self.vec.extend_from_slice(string.as_bytes())
+    }
+
+    /// Copies elements from `src` range to the end of the string.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if the starting point or end point do not lie on a [`char`]
+    /// boundary, or if they're out of bounds.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// #![feature(string_extend_from_within)]
+    /// let mut string = String::from("abcde");
+    ///
+    /// string.extend_from_within(2..);
+    /// assert_eq!(string, "abcdecde");
+    ///
+    /// string.extend_from_within(..2);
+    /// assert_eq!(string, "abcdecdeab");
+    ///
+    /// string.extend_from_within(4..8);
+    /// assert_eq!(string, "abcdecdeabecde");
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "string_extend_from_within", issue = "none")]
+    pub fn extend_from_within<R>(&mut self, src: R)
+    where
+        R: RangeBounds<usize>,
+    {
+        let src @ Range { start, end } = slice::range(src, ..self.len());
+
+        assert!(self.is_char_boundary(start));
+        assert!(self.is_char_boundary(end));
+
+        self.vec.extend_from_within(src);
     }
 
     /// Returns this `String`'s capacity, in bytes.
@@ -885,6 +938,7 @@ impl String {
     /// // ... doesn't actually increase.
     /// assert_eq!(10, s.capacity());
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn reserve(&mut self, additional: usize) {
@@ -932,6 +986,7 @@ impl String {
     /// // ... doesn't actually increase.
     /// assert_eq!(10, s.capacity());
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn reserve_exact(&mut self, additional: usize) {
@@ -1026,6 +1081,7 @@ impl String {
     /// s.shrink_to_fit();
     /// assert_eq!(3, s.capacity());
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn shrink_to_fit(&mut self) {
@@ -1053,6 +1109,7 @@ impl String {
     /// s.shrink_to(0);
     /// assert!(s.capacity() >= 3);
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[unstable(feature = "shrink_to", reason = "new API", issue = "56431")]
     pub fn shrink_to(&mut self, min_capacity: usize) {
@@ -1074,6 +1131,7 @@ impl String {
     ///
     /// assert_eq!("abc123", s);
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn push(&mut self, ch: char) {
@@ -1202,6 +1260,80 @@ impl String {
         ch
     }
 
+    /// Remove all matches of pattern `pat` in the `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(string_remove_matches)]
+    /// let mut s = String::from("Trees are not green, the sky is not blue.");
+    /// s.remove_matches("not ");
+    /// assert_eq!("Trees are green, the sky is blue.", s);
+    /// ```
+    ///
+    /// Matches will be detected and removed iteratively, so in cases where
+    /// patterns overlap, only the first pattern will be removed:
+    ///
+    /// ```
+    /// #![feature(string_remove_matches)]
+    /// let mut s = String::from("banana");
+    /// s.remove_matches("ana");
+    /// assert_eq!("bna", s);
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "string_remove_matches", reason = "new API", issue = "72826")]
+    pub fn remove_matches<'a, P>(&'a mut self, pat: P)
+    where
+        P: for<'x> Pattern<'x>,
+    {
+        use core::str::pattern::Searcher;
+
+        let rejections = {
+            let mut searcher = pat.into_searcher(self);
+            // Per Searcher::next:
+            //
+            // A Match result needs to contain the whole matched pattern,
+            // however Reject results may be split up into arbitrary many
+            // adjacent fragments. Both ranges may have zero length.
+            //
+            // In practice the implementation of Searcher::next_match tends to
+            // be more efficient, so we use it here and do some work to invert
+            // matches into rejections since that's what we want to copy below.
+            let mut front = 0;
+            let rejections: Vec<_> = from_fn(|| {
+                let (start, end) = searcher.next_match()?;
+                let prev_front = front;
+                front = end;
+                Some((prev_front, start))
+            })
+            .collect();
+            rejections.into_iter().chain(core::iter::once((front, self.len())))
+        };
+
+        let mut len = 0;
+        let ptr = self.vec.as_mut_ptr();
+
+        for (start, end) in rejections {
+            let count = end - start;
+            if start != len {
+                // SAFETY: per Searcher::next:
+                //
+                // The stream of Match and Reject values up to a Done will
+                // contain index ranges that are adjacent, non-overlapping,
+                // covering the whole haystack, and laying on utf8
+                // boundaries.
+                unsafe {
+                    ptr::copy(ptr.add(start), ptr.add(len), count);
+                }
+            }
+            len += count;
+        }
+
+        unsafe {
+            self.vec.set_len(len);
+        }
+    }
+
     /// Retains only the characters specified by the predicate.
     ///
     /// In other words, remove all characters `c` such that `f(c)` returns `false`.
@@ -1233,37 +1365,44 @@ impl String {
     where
         F: FnMut(char) -> bool,
     {
-        let len = self.len();
-        let mut del_bytes = 0;
-        let mut idx = 0;
-
-        unsafe {
-            self.vec.set_len(0);
+        struct SetLenOnDrop<'a> {
+            s: &'a mut String,
+            idx: usize,
+            del_bytes: usize,
         }
 
-        while idx < len {
-            let ch = unsafe { self.get_unchecked(idx..len).chars().next().unwrap() };
+        impl<'a> Drop for SetLenOnDrop<'a> {
+            fn drop(&mut self) {
+                let new_len = self.idx - self.del_bytes;
+                debug_assert!(new_len <= self.s.len());
+                unsafe { self.s.vec.set_len(new_len) };
+            }
+        }
+
+        let len = self.len();
+        let mut guard = SetLenOnDrop { s: self, idx: 0, del_bytes: 0 };
+
+        while guard.idx < len {
+            let ch = unsafe { guard.s.get_unchecked(guard.idx..len).chars().next().unwrap() };
             let ch_len = ch.len_utf8();
 
             if !f(ch) {
-                del_bytes += ch_len;
-            } else if del_bytes > 0 {
+                guard.del_bytes += ch_len;
+            } else if guard.del_bytes > 0 {
                 unsafe {
                     ptr::copy(
-                        self.vec.as_ptr().add(idx),
-                        self.vec.as_mut_ptr().add(idx - del_bytes),
+                        guard.s.vec.as_ptr().add(guard.idx),
+                        guard.s.vec.as_mut_ptr().add(guard.idx - guard.del_bytes),
                         ch_len,
                     );
                 }
             }
 
             // Point idx to the next char
-            idx += ch_len;
+            guard.idx += ch_len;
         }
 
-        unsafe {
-            self.vec.set_len(len - del_bytes);
-        }
+        drop(guard);
     }
 
     /// Inserts a character into this `String` at a byte position.
@@ -1289,6 +1428,7 @@ impl String {
     ///
     /// assert_eq!("foo", s);
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn insert(&mut self, idx: usize, ch: char) {
@@ -1301,6 +1441,7 @@ impl String {
         }
     }
 
+    #[cfg(not(no_global_oom_handling))]
     unsafe fn insert_bytes(&mut self, idx: usize, bytes: &[u8]) {
         let len = self.len();
         let amt = bytes.len();
@@ -1308,7 +1449,7 @@ impl String {
 
         unsafe {
             ptr::copy(self.vec.as_ptr().add(idx), self.vec.as_mut_ptr().add(idx + amt), len - idx);
-            ptr::copy(bytes.as_ptr(), self.vec.as_mut_ptr().add(idx), amt);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), self.vec.as_mut_ptr().add(idx), amt);
             self.vec.set_len(len + amt);
         }
     }
@@ -1334,6 +1475,7 @@ impl String {
     ///
     /// assert_eq!("foobar", s);
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "insert_str", since = "1.16.0")]
     pub fn insert_str(&mut self, idx: usize, string: &str) {
@@ -1390,7 +1532,6 @@ impl String {
     /// assert_eq!(fancy_f.len(), 4);
     /// assert_eq!(fancy_f.chars().count(), 3);
     /// ```
-    #[doc(alias = "length")]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn len(&self) -> usize {
@@ -1439,6 +1580,7 @@ impl String {
     /// assert_eq!(world, "World!");
     /// # }
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[stable(feature = "string_split_off", since = "1.16.0")]
     #[must_use = "use `.truncate()` if you don't need the other half"]
@@ -1545,6 +1687,7 @@ impl String {
     /// s.replace_range(..beta_offset, "Α is capital alpha; ");
     /// assert_eq!(s, "Α is capital alpha; β is beta");
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "splice", since = "1.27.0")]
     pub fn replace_range<R>(&mut self, range: R, replace_with: &str)
     where
@@ -1591,6 +1734,7 @@ impl String {
     ///
     /// let b = s.into_boxed_str();
     /// ```
+    #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "box_str", since = "1.4.0")]
     #[inline]
     pub fn into_boxed_str(self) -> Box<str> {
@@ -1685,6 +1829,7 @@ impl fmt::Display for FromUtf16Error {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Clone for String {
     fn clone(&self) -> Self {
@@ -1696,6 +1841,7 @@ impl Clone for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl FromIterator<char> for String {
     fn from_iter<I: IntoIterator<Item = char>>(iter: I) -> String {
@@ -1705,6 +1851,7 @@ impl FromIterator<char> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "string_from_iter_by_ref", since = "1.17.0")]
 impl<'a> FromIterator<&'a char> for String {
     fn from_iter<I: IntoIterator<Item = &'a char>>(iter: I) -> String {
@@ -1714,6 +1861,7 @@ impl<'a> FromIterator<&'a char> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> FromIterator<&'a str> for String {
     fn from_iter<I: IntoIterator<Item = &'a str>>(iter: I) -> String {
@@ -1723,6 +1871,7 @@ impl<'a> FromIterator<&'a str> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "extend_string", since = "1.4.0")]
 impl FromIterator<String> for String {
     fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> String {
@@ -1741,6 +1890,7 @@ impl FromIterator<String> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_str2", since = "1.45.0")]
 impl FromIterator<Box<str>> for String {
     fn from_iter<I: IntoIterator<Item = Box<str>>>(iter: I) -> String {
@@ -1750,6 +1900,7 @@ impl FromIterator<Box<str>> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "herd_cows", since = "1.19.0")]
 impl<'a> FromIterator<Cow<'a, str>> for String {
     fn from_iter<I: IntoIterator<Item = Cow<'a, str>>>(iter: I) -> String {
@@ -1769,6 +1920,7 @@ impl<'a> FromIterator<Cow<'a, str>> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Extend<char> for String {
     fn extend<I: IntoIterator<Item = char>>(&mut self, iter: I) {
@@ -1789,6 +1941,7 @@ impl Extend<char> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "extend_ref", since = "1.2.0")]
 impl<'a> Extend<&'a char> for String {
     fn extend<I: IntoIterator<Item = &'a char>>(&mut self, iter: I) {
@@ -1806,6 +1959,7 @@ impl<'a> Extend<&'a char> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> Extend<&'a str> for String {
     fn extend<I: IntoIterator<Item = &'a str>>(&mut self, iter: I) {
@@ -1818,6 +1972,7 @@ impl<'a> Extend<&'a str> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_str2", since = "1.45.0")]
 impl Extend<Box<str>> for String {
     fn extend<I: IntoIterator<Item = Box<str>>>(&mut self, iter: I) {
@@ -1825,6 +1980,7 @@ impl Extend<Box<str>> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "extend_string", since = "1.4.0")]
 impl Extend<String> for String {
     fn extend<I: IntoIterator<Item = String>>(&mut self, iter: I) {
@@ -1837,6 +1993,7 @@ impl Extend<String> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "herd_cows", since = "1.19.0")]
 impl<'a> Extend<Cow<'a, str>> for String {
     fn extend<I: IntoIterator<Item = Cow<'a, str>>>(&mut self, iter: I) {
@@ -1938,8 +2095,11 @@ macro_rules! impl_eq {
 
 impl_eq! { String, str }
 impl_eq! { String, &'a str }
+#[cfg(not(no_global_oom_handling))]
 impl_eq! { Cow<'a, str>, str }
+#[cfg(not(no_global_oom_handling))]
 impl_eq! { Cow<'a, str>, &'b str }
+#[cfg(not(no_global_oom_handling))]
 impl_eq! { Cow<'a, str>, String }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -2012,6 +2172,7 @@ impl hash::Hash for String {
 /// let b = " world";
 /// let c = a.to_string() + b;
 /// ```
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Add<&str> for String {
     type Output = String;
@@ -2026,6 +2187,7 @@ impl Add<&str> for String {
 /// Implements the `+=` operator for appending to a `String`.
 ///
 /// This has the same behavior as the [`push_str`][String::push_str] method.
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "stringaddassign", since = "1.12.0")]
 impl AddAssign<&str> for String {
     #[inline]
@@ -2158,6 +2320,7 @@ impl ops::DerefMut for String {
 #[stable(feature = "str_parse_error", since = "1.5.0")]
 pub type ParseError = core::convert::Infallible;
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl FromStr for String {
     type Err = core::convert::Infallible;
@@ -2201,6 +2364,7 @@ pub trait ToString {
 /// if the `Display` implementation returns an error.
 /// This indicates an incorrect `Display` implementation
 /// since `fmt::Write for String` never returns an error itself.
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: fmt::Display + ?Sized> ToString for T {
     // A common guideline is to not inline generic functions. However,
@@ -2209,14 +2373,16 @@ impl<T: fmt::Display + ?Sized> ToString for T {
     // to try to remove it.
     #[inline]
     default fn to_string(&self) -> String {
-        use fmt::Write;
         let mut buf = String::new();
-        buf.write_fmt(format_args!("{}", self))
+        let mut formatter = core::fmt::Formatter::new(&mut buf);
+        // Bypass format_args!() to avoid write_str with zero-length strs
+        fmt::Display::fmt(self, &mut formatter)
             .expect("a Display implementation returned an error unexpectedly");
         buf
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "char_to_string_specialization", since = "1.46.0")]
 impl ToString for char {
     #[inline]
@@ -2225,6 +2391,50 @@ impl ToString for char {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "u8_to_string_specialization", since = "1.54.0")]
+impl ToString for u8 {
+    #[inline]
+    fn to_string(&self) -> String {
+        let mut buf = String::with_capacity(3);
+        let mut n = *self;
+        if n >= 10 {
+            if n >= 100 {
+                buf.push((b'0' + n / 100) as char);
+                n %= 100;
+            }
+            buf.push((b'0' + n / 10) as char);
+            n %= 10;
+        }
+        buf.push((b'0' + n) as char);
+        buf
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+#[stable(feature = "i8_to_string_specialization", since = "1.54.0")]
+impl ToString for i8 {
+    #[inline]
+    fn to_string(&self) -> String {
+        let mut buf = String::with_capacity(4);
+        if self.is_negative() {
+            buf.push('-');
+        }
+        let mut n = self.unsigned_abs();
+        if n >= 10 {
+            if n >= 100 {
+                buf.push('1');
+                n -= 100;
+            }
+            buf.push((b'0' + n / 10) as char);
+            n %= 10;
+        }
+        buf.push((b'0' + n) as char);
+        buf
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "str_to_string_specialization", since = "1.9.0")]
 impl ToString for str {
     #[inline]
@@ -2233,6 +2443,7 @@ impl ToString for str {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_str_to_string_specialization", since = "1.17.0")]
 impl ToString for Cow<'_, str> {
     #[inline]
@@ -2241,6 +2452,7 @@ impl ToString for Cow<'_, str> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "string_to_string_specialization", since = "1.17.0")]
 impl ToString for String {
     #[inline]
@@ -2273,17 +2485,22 @@ impl AsRef<[u8]> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl From<&str> for String {
+    /// Converts a `&str` into a [`String`].
+    ///
+    /// The result is allocated on the heap.
     #[inline]
     fn from(s: &str) -> String {
         s.to_owned()
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "from_mut_str_for_string", since = "1.44.0")]
 impl From<&mut str> for String {
-    /// Converts a `&mut str` into a `String`.
+    /// Converts a `&mut str` into a [`String`].
     ///
     /// The result is allocated on the heap.
     #[inline]
@@ -2292,8 +2509,12 @@ impl From<&mut str> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "from_ref_string", since = "1.35.0")]
 impl From<&String> for String {
+    /// Converts a `&String` into a [`String`].
+    ///
+    /// This clones `s` and returns the clone.
     #[inline]
     fn from(s: &String) -> String {
         s.clone()
@@ -2304,7 +2525,7 @@ impl From<&String> for String {
 #[cfg(not(test))]
 #[stable(feature = "string_from_box", since = "1.18.0")]
 impl From<Box<str>> for String {
-    /// Converts the given boxed `str` slice to a `String`.
+    /// Converts the given boxed `str` slice to a [`String`].
     /// It is notable that the `str` slice is owned.
     ///
     /// # Examples
@@ -2323,9 +2544,10 @@ impl From<Box<str>> for String {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_from_str", since = "1.20.0")]
 impl From<String> for Box<str> {
-    /// Converts the given `String` to a boxed `str` slice that is owned.
+    /// Converts the given [`String`] to a boxed `str` slice that is owned.
     ///
     /// # Examples
     ///
@@ -2343,16 +2565,34 @@ impl From<String> for Box<str> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "string_from_cow_str", since = "1.14.0")]
 impl<'a> From<Cow<'a, str>> for String {
+    /// Converts a clone-on-write string to an owned
+    /// instance of [`String`].
+    ///
+    /// This extracts the owned string,
+    /// clones the string if it is not already owned.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::borrow::Cow;
+    /// // If the string is not owned...
+    /// let cow: Cow<str> = Cow::Borrowed("eggplant");
+    /// // It will allocate on the heap and copy the string.
+    /// let owned: String = String::from(cow);
+    /// assert_eq!(&owned[..], "eggplant");
+    /// ```
     fn from(s: Cow<'a, str>) -> String {
         s.into_owned()
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> From<&'a str> for Cow<'a, str> {
-    /// Converts a string slice into a Borrowed variant.
+    /// Converts a string slice into a [`Borrowed`] variant.
     /// No heap allocation is performed, and the string
     /// is not copied.
     ///
@@ -2362,15 +2602,18 @@ impl<'a> From<&'a str> for Cow<'a, str> {
     /// # use std::borrow::Cow;
     /// assert_eq!(Cow::from("eggplant"), Cow::Borrowed("eggplant"));
     /// ```
+    ///
+    /// [`Borrowed`]: crate::borrow::Cow::Borrowed
     #[inline]
     fn from(s: &'a str) -> Cow<'a, str> {
         Cow::Borrowed(s)
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> From<String> for Cow<'a, str> {
-    /// Converts a String into an Owned variant.
+    /// Converts a [`String`] into an [`Owned`] variant.
     /// No heap allocation is performed, and the string
     /// is not copied.
     ///
@@ -2382,15 +2625,18 @@ impl<'a> From<String> for Cow<'a, str> {
     /// let s2 = "eggplant".to_string();
     /// assert_eq!(Cow::from(s), Cow::<'static, str>::Owned(s2));
     /// ```
+    ///
+    /// [`Owned`]: crate::borrow::Cow::Owned
     #[inline]
     fn from(s: String) -> Cow<'a, str> {
         Cow::Owned(s)
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_from_string_ref", since = "1.28.0")]
 impl<'a> From<&'a String> for Cow<'a, str> {
-    /// Converts a String reference into a Borrowed variant.
+    /// Converts a [`String`] reference into a [`Borrowed`] variant.
     /// No heap allocation is performed, and the string
     /// is not copied.
     ///
@@ -2401,12 +2647,15 @@ impl<'a> From<&'a String> for Cow<'a, str> {
     /// let s = "eggplant".to_string();
     /// assert_eq!(Cow::from(&s), Cow::Borrowed("eggplant"));
     /// ```
+    ///
+    /// [`Borrowed`]: crate::borrow::Cow::Borrowed
     #[inline]
     fn from(s: &'a String) -> Cow<'a, str> {
         Cow::Borrowed(s.as_str())
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_str_from_iter", since = "1.12.0")]
 impl<'a> FromIterator<char> for Cow<'a, str> {
     fn from_iter<I: IntoIterator<Item = char>>(it: I) -> Cow<'a, str> {
@@ -2414,6 +2663,7 @@ impl<'a> FromIterator<char> for Cow<'a, str> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_str_from_iter", since = "1.12.0")]
 impl<'a, 'b> FromIterator<&'b str> for Cow<'a, str> {
     fn from_iter<I: IntoIterator<Item = &'b str>>(it: I) -> Cow<'a, str> {
@@ -2421,6 +2671,7 @@ impl<'a, 'b> FromIterator<&'b str> for Cow<'a, str> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_str_from_iter", since = "1.12.0")]
 impl<'a> FromIterator<String> for Cow<'a, str> {
     fn from_iter<I: IntoIterator<Item = String>>(it: I) -> Cow<'a, str> {
@@ -2430,7 +2681,7 @@ impl<'a> FromIterator<String> for Cow<'a, str> {
 
 #[stable(feature = "from_string_for_vec_u8", since = "1.14.0")]
 impl From<String> for Vec<u8> {
-    /// Converts the given `String` to a vector `Vec` that holds values of type `u8`.
+    /// Converts the given [`String`] to a vector [`Vec`] that holds values of type [`u8`].
     ///
     /// # Examples
     ///
@@ -2449,6 +2700,7 @@ impl From<String> for Vec<u8> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl fmt::Write for String {
     #[inline]
@@ -2514,33 +2766,31 @@ impl<'a> Drain<'a> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(string_drain_as_str)]
     /// let mut s = String::from("abc");
     /// let mut drain = s.drain(..);
     /// assert_eq!(drain.as_str(), "abc");
     /// let _ = drain.next().unwrap();
     /// assert_eq!(drain.as_str(), "bc");
     /// ```
-    #[unstable(feature = "string_drain_as_str", issue = "76905")] // Note: uncomment AsRef impls below when stabilizing.
+    #[stable(feature = "string_drain_as_str", since = "1.55.0")]
     pub fn as_str(&self) -> &str {
         self.iter.as_str()
     }
 }
 
-// Uncomment when stabilizing `string_drain_as_str`.
-// #[unstable(feature = "string_drain_as_str", issue = "76905")]
-// impl<'a> AsRef<str> for Drain<'a> {
-//     fn as_ref(&self) -> &str {
-//         self.as_str()
-//     }
-// }
-//
-// #[unstable(feature = "string_drain_as_str", issue = "76905")]
-// impl<'a> AsRef<[u8]> for Drain<'a> {
-//     fn as_ref(&self) -> &[u8] {
-//         self.as_str().as_bytes()
-//     }
-// }
+#[stable(feature = "string_drain_as_str", since = "1.55.0")]
+impl<'a> AsRef<str> for Drain<'a> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[stable(feature = "string_drain_as_str", since = "1.55.0")]
+impl<'a> AsRef<[u8]> for Drain<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
+}
 
 #[stable(feature = "drain", since = "1.6.0")]
 impl Iterator for Drain<'_> {
@@ -2572,8 +2822,17 @@ impl DoubleEndedIterator for Drain<'_> {
 #[stable(feature = "fused", since = "1.26.0")]
 impl FusedIterator for Drain<'_> {}
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "from_char_for_string", since = "1.46.0")]
 impl From<char> for String {
+    /// Allocates an owned [`String`] from a single character.
+    ///
+    /// # Example
+    /// ```rust
+    /// let c: char = 'a';
+    /// let s: String = String::from(c);
+    /// assert_eq!("a", &s[..]);
+    /// ```
     #[inline]
     fn from(c: char) -> Self {
         c.to_string()

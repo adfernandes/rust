@@ -26,6 +26,11 @@ pub struct EarlyOtherwiseBranch;
 
 impl<'tcx> MirPass<'tcx> for EarlyOtherwiseBranch {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        //  FIXME(#78496)
+        if !tcx.sess.opts.debugging_opts.unsound_mir_opts {
+            return;
+        }
+
         if tcx.sess.mir_opt_level() < 3 {
             return;
         }
@@ -159,16 +164,13 @@ impl<'tcx> MirPass<'tcx> for EarlyOtherwiseBranch {
         // Since this optimization adds new basic blocks and invalidates others,
         // clean up the cfg to make it nicer for other passes
         if should_cleanup {
-            simplify_cfg(body);
+            simplify_cfg(tcx, body);
         }
     }
 }
 
 fn is_switch<'tcx>(terminator: &Terminator<'tcx>) -> bool {
-    match terminator.kind {
-        TerminatorKind::SwitchInt { .. } => true,
-        _ => false,
-    }
+    matches!(terminator.kind, TerminatorKind::SwitchInt { .. })
 }
 
 struct Helper<'a, 'tcx> {

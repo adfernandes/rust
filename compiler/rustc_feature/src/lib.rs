@@ -1,7 +1,7 @@
 //! # Feature gates
 //!
 //! This crate declares the set of past and present unstable features in the compiler.
-//! Feature gate checking itself is done in `librustc_ast_passes/feature_gate.rs`
+//! Feature gate checking itself is done in `rustc_ast_passes/src/feature_gate.rs`
 //! at the moment.
 //!
 //! Features are enabled in programs via the crate-level attributes of
@@ -146,7 +146,7 @@ pub fn find_feature_issue(feature: Symbol, issue: GateIssue) -> Option<NonZeroU3
 }
 
 pub use accepted::ACCEPTED_FEATURES;
-pub use active::{Features, ACTIVE_FEATURES, INCOMPATIBLE_FEATURES, INCOMPLETE_FEATURES};
+pub use active::{Features, ACTIVE_FEATURES, INCOMPATIBLE_FEATURES};
 pub use builtin_attrs::{
     deprecated_attributes, find_gated_cfg, is_builtin_attr_name, AttributeGate, AttributeTemplate,
     AttributeType, BuiltinAttribute, GatedCfg, BUILTIN_ATTRIBUTES, BUILTIN_ATTRIBUTE_MAP,

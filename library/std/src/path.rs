@@ -569,7 +569,7 @@ pub struct Components<'a> {
     prefix: Option<Prefix<'a>>,
 
     // true if path *physically* has a root separator; for most Windows
-    // prefixes, it may have a "logical" rootseparator for the purposes of
+    // prefixes, it may have a "logical" root separator for the purposes of
     // normalization, e.g.,  \\server\share == \\server\share\.
     has_physical_root: bool,
 
@@ -951,7 +951,7 @@ impl FusedIterator for Components<'_> {}
 impl<'a> cmp::PartialEq for Components<'a> {
     #[inline]
     fn eq(&self, other: &Components<'a>) -> bool {
-        Iterator::eq(self.clone(), other.clone())
+        Iterator::eq(self.clone().rev(), other.clone().rev())
     }
 }
 
@@ -1065,7 +1065,6 @@ impl FusedIterator for Ancestors<'_> {}
 /// ```
 ///
 /// Which method works best depends on what kind of situation you're in.
-#[derive(Clone)]
 #[cfg_attr(not(test), rustc_diagnostic_item = "PathBuf")]
 #[stable(feature = "rust1", since = "1.0.0")]
 // FIXME:
@@ -1406,8 +1405,24 @@ impl PathBuf {
     }
 }
 
+#[stable(feature = "rust1", since = "1.0.0")]
+impl Clone for PathBuf {
+    #[inline]
+    fn clone(&self) -> Self {
+        PathBuf { inner: self.inner.clone() }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.inner.clone_from(&source.inner)
+    }
+}
+
 #[stable(feature = "box_from_path", since = "1.17.0")]
 impl From<&Path> for Box<Path> {
+    /// Creates a boxed [`Path`] from a reference.
+    ///
+    /// This will allocate and clone `path` to it.
     fn from(path: &Path) -> Box<Path> {
         let boxed: Box<OsStr> = path.inner.into();
         let rw = Box::into_raw(boxed) as *mut Path;
@@ -1417,6 +1432,9 @@ impl From<&Path> for Box<Path> {
 
 #[stable(feature = "box_from_cow", since = "1.45.0")]
 impl From<Cow<'_, Path>> for Box<Path> {
+    /// Creates a boxed [`Path`] from a clone-on-write pointer.
+    ///
+    /// Converting from a `Cow::Owned` does not clone or allocate.
     #[inline]
     fn from(cow: Cow<'_, Path>) -> Box<Path> {
         match cow {
@@ -1459,6 +1477,9 @@ impl Clone for Box<Path> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized + AsRef<OsStr>> From<&T> for PathBuf {
+    /// Converts a borrowed `OsStr` to a `PathBuf`.
+    ///
+    /// Allocates a [`PathBuf`] and copies the data into it.
     #[inline]
     fn from(s: &T) -> PathBuf {
         PathBuf::from(s.as_ref().to_os_string())
@@ -1467,7 +1488,7 @@ impl<T: ?Sized + AsRef<OsStr>> From<&T> for PathBuf {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl From<OsString> for PathBuf {
-    /// Converts a `OsString` into a `PathBuf`
+    /// Converts an [`OsString`] into a [`PathBuf`]
     ///
     /// This conversion does not allocate or copy memory.
     #[inline]
@@ -1478,7 +1499,7 @@ impl From<OsString> for PathBuf {
 
 #[stable(feature = "from_path_buf_for_os_string", since = "1.14.0")]
 impl From<PathBuf> for OsString {
-    /// Converts a `PathBuf` into a `OsString`
+    /// Converts a [`PathBuf`] into an [`OsString`]
     ///
     /// This conversion does not allocate or copy memory.
     #[inline]
@@ -1489,7 +1510,7 @@ impl From<PathBuf> for OsString {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl From<String> for PathBuf {
-    /// Converts a `String` into a `PathBuf`
+    /// Converts a [`String`] into a [`PathBuf`]
     ///
     /// This conversion does not allocate or copy memory.
     #[inline]
@@ -1563,6 +1584,10 @@ impl Default for PathBuf {
 
 #[stable(feature = "cow_from_path", since = "1.6.0")]
 impl<'a> From<&'a Path> for Cow<'a, Path> {
+    /// Creates a clone-on-write pointer from a reference to
+    /// [`Path`].
+    ///
+    /// This conversion does not clone or allocate.
     #[inline]
     fn from(s: &'a Path) -> Cow<'a, Path> {
         Cow::Borrowed(s)
@@ -1571,6 +1596,10 @@ impl<'a> From<&'a Path> for Cow<'a, Path> {
 
 #[stable(feature = "cow_from_path", since = "1.6.0")]
 impl<'a> From<PathBuf> for Cow<'a, Path> {
+    /// Creates a clone-on-write pointer from an owned
+    /// instance of [`PathBuf`].
+    ///
+    /// This conversion does not clone or allocate.
     #[inline]
     fn from(s: PathBuf) -> Cow<'a, Path> {
         Cow::Owned(s)
@@ -1579,6 +1608,10 @@ impl<'a> From<PathBuf> for Cow<'a, Path> {
 
 #[stable(feature = "cow_from_pathbuf_ref", since = "1.28.0")]
 impl<'a> From<&'a PathBuf> for Cow<'a, Path> {
+    /// Creates a clone-on-write pointer from a reference to
+    /// [`PathBuf`].
+    ///
+    /// This conversion does not clone or allocate.
     #[inline]
     fn from(p: &'a PathBuf) -> Cow<'a, Path> {
         Cow::Borrowed(p.as_path())
@@ -1587,6 +1620,9 @@ impl<'a> From<&'a PathBuf> for Cow<'a, Path> {
 
 #[stable(feature = "pathbuf_from_cow_path", since = "1.28.0")]
 impl<'a> From<Cow<'a, Path>> for PathBuf {
+    /// Converts a clone-on-write pointer to an owned path.
+    ///
+    /// Converting from a `Cow::Owned` does not clone or allocate.
     #[inline]
     fn from(p: Cow<'a, Path>) -> Self {
         p.into_owned()
@@ -1595,7 +1631,7 @@ impl<'a> From<Cow<'a, Path>> for PathBuf {
 
 #[stable(feature = "shared_from_slice2", since = "1.24.0")]
 impl From<PathBuf> for Arc<Path> {
-    /// Converts a `PathBuf` into an `Arc` by moving the `PathBuf` data into a new `Arc` buffer.
+    /// Converts a [`PathBuf`] into an [`Arc`] by moving the [`PathBuf`] data into a new [`Arc`] buffer.
     #[inline]
     fn from(s: PathBuf) -> Arc<Path> {
         let arc: Arc<OsStr> = Arc::from(s.into_os_string());
@@ -1605,7 +1641,7 @@ impl From<PathBuf> for Arc<Path> {
 
 #[stable(feature = "shared_from_slice2", since = "1.24.0")]
 impl From<&Path> for Arc<Path> {
-    /// Converts a `Path` into an `Arc` by copying the `Path` data into a new `Arc` buffer.
+    /// Converts a [`Path`] into an [`Arc`] by copying the [`Path`] data into a new [`Arc`] buffer.
     #[inline]
     fn from(s: &Path) -> Arc<Path> {
         let arc: Arc<OsStr> = Arc::from(s.as_os_str());
@@ -1615,7 +1651,7 @@ impl From<&Path> for Arc<Path> {
 
 #[stable(feature = "shared_from_slice2", since = "1.24.0")]
 impl From<PathBuf> for Rc<Path> {
-    /// Converts a `PathBuf` into an `Rc` by moving the `PathBuf` data into a new `Rc` buffer.
+    /// Converts a [`PathBuf`] into an [`Rc`] by moving the [`PathBuf`] data into a new `Rc` buffer.
     #[inline]
     fn from(s: PathBuf) -> Rc<Path> {
         let rc: Rc<OsStr> = Rc::from(s.into_os_string());
@@ -1625,7 +1661,7 @@ impl From<PathBuf> for Rc<Path> {
 
 #[stable(feature = "shared_from_slice2", since = "1.24.0")]
 impl From<&Path> for Rc<Path> {
-    /// Converts a `Path` into an `Rc` by copying the `Path` data into a new `Rc` buffer.
+    /// Converts a [`Path`] into an [`Rc`] by copying the [`Path`] data into a new `Rc` buffer.
     #[inline]
     fn from(s: &Path) -> Rc<Path> {
         let rc: Rc<OsStr> = Rc::from(s.as_os_str());
@@ -2450,10 +2486,10 @@ impl Path {
     /// Returns `true` if the path points at an existing entity.
     ///
     /// This function will traverse symbolic links to query information about the
-    /// destination file. In case of broken symbolic links this will return `false`.
+    /// destination file.
     ///
-    /// If you cannot access the directory containing the file, e.g., because of a
-    /// permission error, this will return `false`.
+    /// If you cannot access the metadata of the file, e.g. because of a
+    /// permission error or broken symbolic links, this will return `false`.
     ///
     /// # Examples
     ///
@@ -2472,13 +2508,39 @@ impl Path {
         fs::metadata(self).is_ok()
     }
 
+    /// Returns `Ok(true)` if the path points at an existing entity.
+    ///
+    /// This function will traverse symbolic links to query information about the
+    /// destination file. In case of broken symbolic links this will return `Ok(false)`.
+    ///
+    /// As opposed to the `exists()` method, this one doesn't silently ignore errors
+    /// unrelated to the path not existing. (E.g. it will return `Err(_)` in case of permission
+    /// denied on some of the parent directories.)
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(path_try_exists)]
+    ///
+    /// use std::path::Path;
+    /// assert!(!Path::new("does_not_exist.txt").try_exists().expect("Can't check existence of file does_not_exist.txt"));
+    /// assert!(Path::new("/root/secret_file.txt").try_exists().is_err());
+    /// ```
+    // FIXME: stabilization should modify documentation of `exists()` to recommend this method
+    // instead.
+    #[unstable(feature = "path_try_exists", issue = "83186")]
+    #[inline]
+    pub fn try_exists(&self) -> io::Result<bool> {
+        fs::try_exists(self)
+    }
+
     /// Returns `true` if the path exists on disk and is pointing at a regular file.
     ///
     /// This function will traverse symbolic links to query information about the
-    /// destination file. In case of broken symbolic links this will return `false`.
+    /// destination file.
     ///
-    /// If you cannot access the directory containing the file, e.g., because of a
-    /// permission error, this will return `false`.
+    /// If you cannot access the metadata of the file, e.g. because of a
+    /// permission error or broken symbolic links, this will return `false`.
     ///
     /// # Examples
     ///
@@ -2507,10 +2569,10 @@ impl Path {
     /// Returns `true` if the path exists on disk and is pointing at a directory.
     ///
     /// This function will traverse symbolic links to query information about the
-    /// destination file. In case of broken symbolic links this will return `false`.
+    /// destination file.
     ///
-    /// If you cannot access the directory containing the file, e.g., because of a
-    /// permission error, this will return `false`.
+    /// If you cannot access the metadata of the file, e.g. because of a
+    /// permission error or broken symbolic links, this will return `false`.
     ///
     /// # Examples
     ///
@@ -2528,6 +2590,32 @@ impl Path {
     #[stable(feature = "path_ext", since = "1.5.0")]
     pub fn is_dir(&self) -> bool {
         fs::metadata(self).map(|m| m.is_dir()).unwrap_or(false)
+    }
+
+    /// Returns true if the path exists on disk and is pointing at a symbolic link.
+    ///
+    /// This function will not traverse symbolic links.
+    /// In case of a broken symbolic link this will also return true.
+    ///
+    /// If you cannot access the directory containing the file, e.g., because of a
+    /// permission error, this will return false.
+    ///
+    /// # Examples
+    ///
+    #[cfg_attr(unix, doc = "```no_run")]
+    #[cfg_attr(not(unix), doc = "```ignore")]
+    /// #![feature(is_symlink)]
+    /// use std::path::Path;
+    /// use std::os::unix::fs::symlink;
+    ///
+    /// let link_path = Path::new("link");
+    /// symlink("/origin_does_not_exists/", link_path).unwrap();
+    /// assert_eq!(link_path.is_symlink(), true);
+    /// assert_eq!(link_path.exists(), false);
+    /// ```
+    #[unstable(feature = "is_symlink", issue = "85748")]
+    pub fn is_symlink(&self) -> bool {
+        fs::symlink_metadata(self).map(|m| m.is_symlink()).unwrap_or(false)
     }
 
     /// Converts a [`Box<Path>`](Box) into a [`PathBuf`] without copying or

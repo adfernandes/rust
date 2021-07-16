@@ -10,7 +10,7 @@ use super::spanview::write_mir_fn_spanview;
 use crate::transform::MirSource;
 use either::Either;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::def_id::DefId;
 use rustc_index::vec::Idx;
 use rustc_middle::mir::interpret::{
     read_target_uint, AllocId, Allocation, ConstValue, GlobalAlloc, Pointer,
@@ -99,7 +99,10 @@ pub fn dump_enabled<'tcx>(tcx: TyCtxt<'tcx>, pass_name: &str, def_id: DefId) -> 
     });
     filters.split('|').any(|or_filter| {
         or_filter.split('&').all(|and_filter| {
-            and_filter == "all" || pass_name.contains(and_filter) || node_path.contains(and_filter)
+            let and_filter_trimmed = and_filter.trim();
+            and_filter_trimmed == "all"
+                || pass_name.contains(and_filter_trimmed)
+                || node_path.contains(and_filter_trimmed)
         })
     })
 }
@@ -423,14 +426,14 @@ impl ExtraComments<'tcx> {
     }
 }
 
-fn use_verbose(ty: &&TyS<'tcx>) -> bool {
+fn use_verbose(ty: &&TyS<'tcx>, fn_def: bool) -> bool {
     match ty.kind() {
         ty::Int(_) | ty::Uint(_) | ty::Bool | ty::Char | ty::Float(_) => false,
         // Unit type
         ty::Tuple(g_args) if g_args.is_empty() => false,
-        ty::Tuple(g_args) => g_args.iter().any(|g_arg| use_verbose(&g_arg.expect_ty())),
-        ty::Array(ty, _) => use_verbose(ty),
-        ty::FnDef(..) => false,
+        ty::Tuple(g_args) => g_args.iter().any(|g_arg| use_verbose(&g_arg.expect_ty(), fn_def)),
+        ty::Array(ty, _) => use_verbose(ty, fn_def),
+        ty::FnDef(..) => fn_def,
         _ => true,
     }
 }
@@ -439,17 +442,21 @@ impl Visitor<'tcx> for ExtraComments<'tcx> {
     fn visit_constant(&mut self, constant: &Constant<'tcx>, location: Location) {
         self.super_constant(constant, location);
         let Constant { span, user_ty, literal } = constant;
-        match literal.ty.kind() {
-            ty::Int(_) | ty::Uint(_) | ty::Bool | ty::Char => {}
-            // Unit type
-            ty::Tuple(tys) if tys.is_empty() => {}
-            _ => {
-                self.push("mir::Constant");
-                self.push(&format!("+ span: {}", self.tcx.sess.source_map().span_to_string(*span)));
-                if let Some(user_ty) = user_ty {
-                    self.push(&format!("+ user_ty: {:?}", user_ty));
+        if use_verbose(&literal.ty(), true) {
+            self.push("mir::Constant");
+            self.push(&format!(
+                "+ span: {}",
+                self.tcx.sess.source_map().span_to_embeddable_string(*span)
+            ));
+            if let Some(user_ty) = user_ty {
+                self.push(&format!("+ user_ty: {:?}", user_ty));
+            }
+            match literal {
+                ConstantKind::Ty(literal) => self.push(&format!("+ literal: {:?}", literal)),
+                ConstantKind::Val(val, ty) => {
+                    // To keep the diffs small, we render this almost like we render ty::Const
+                    self.push(&format!("+ literal: Const {{ ty: {}, val: Value({:?}) }}", ty, val))
                 }
-                self.push(&format!("+ literal: {:?}", literal));
             }
         }
     }
@@ -457,10 +464,24 @@ impl Visitor<'tcx> for ExtraComments<'tcx> {
     fn visit_const(&mut self, constant: &&'tcx ty::Const<'tcx>, _: Location) {
         self.super_const(constant);
         let ty::Const { ty, val, .. } = constant;
-        if use_verbose(ty) {
+        if use_verbose(ty, false) {
             self.push("ty::Const");
             self.push(&format!("+ ty: {:?}", ty));
-            self.push(&format!("+ val: {:?}", val));
+            let val = match val {
+                ty::ConstKind::Param(p) => format!("Param({})", p),
+                ty::ConstKind::Infer(infer) => format!("Infer({:?})", infer),
+                ty::ConstKind::Bound(idx, var) => format!("Bound({:?}, {:?})", idx, var),
+                ty::ConstKind::Placeholder(ph) => format!("PlaceHolder({:?})", ph),
+                ty::ConstKind::Unevaluated(uv) => format!(
+                    "Unevaluated({}, {:?}, {:?})",
+                    self.tcx.def_path_str(uv.def.did),
+                    uv.substs,
+                    uv.promoted
+                ),
+                ty::ConstKind::Value(val) => format!("Value({:?})", val),
+                ty::ConstKind::Error(_) => format!("Error"),
+            };
+            self.push(&format!("+ val: {}", val));
         }
     }
 
@@ -493,7 +514,7 @@ impl Visitor<'tcx> for ExtraComments<'tcx> {
 }
 
 fn comment(tcx: TyCtxt<'_>, SourceInfo { span, scope }: SourceInfo) -> String {
-    format!("scope {} at {}", scope.index(), tcx.sess.source_map().span_to_string(span))
+    format!("scope {} at {}", scope.index(), tcx.sess.source_map().span_to_embeddable_string(span))
 }
 
 /// Prints local variables in a scope tree.
@@ -594,7 +615,7 @@ fn write_scope_tree(
                 "{0:1$} // at {2}",
                 indented_header,
                 ALIGN,
-                tcx.sess.source_map().span_to_string(span),
+                tcx.sess.source_map().span_to_embeddable_string(span),
             )?;
         } else {
             writeln!(w, "{}", indented_header)?;
@@ -750,8 +771,8 @@ pub struct RenderAllocation<'a, 'tcx, Tag, Extra> {
 impl<Tag: Copy + Debug, Extra> std::fmt::Display for RenderAllocation<'a, 'tcx, Tag, Extra> {
     fn fmt(&self, w: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let RenderAllocation { tcx, alloc } = *self;
-        write!(w, "size: {}, align: {})", alloc.size.bytes(), alloc.align.bytes())?;
-        if alloc.size == Size::ZERO {
+        write!(w, "size: {}, align: {})", alloc.size().bytes(), alloc.align.bytes())?;
+        if alloc.size() == Size::ZERO {
             // We are done.
             return write!(w, " {{}}");
         }
@@ -796,9 +817,9 @@ fn write_allocation_bytes<Tag: Copy + Debug, Extra>(
     w: &mut dyn std::fmt::Write,
     prefix: &str,
 ) -> std::fmt::Result {
-    let num_lines = alloc.size.bytes_usize().saturating_sub(BYTES_PER_LINE);
+    let num_lines = alloc.size().bytes_usize().saturating_sub(BYTES_PER_LINE);
     // Number of chars needed to represent all line numbers.
-    let pos_width = format!("{:x}", alloc.size.bytes()).len();
+    let pos_width = hex_number_length(alloc.size().bytes());
 
     if num_lines > 0 {
         write!(w, "{}0x{:02$x} │ ", prefix, 0, pos_width)?;
@@ -819,7 +840,7 @@ fn write_allocation_bytes<Tag: Copy + Debug, Extra>(
         }
     };
 
-    while i < alloc.size {
+    while i < alloc.size() {
         // The line start already has a space. While we could remove that space from the line start
         // printing and unconditionally print a space here, that would cause the single-line case
         // to have a single space before it, which looks weird.
@@ -903,7 +924,7 @@ fn write_allocation_bytes<Tag: Copy + Debug, Extra>(
             i += Size::from_bytes(1);
         }
         // Print a new line header if the next line still has some bytes to print.
-        if i == line_start + Size::from_bytes(BYTES_PER_LINE) && i != alloc.size {
+        if i == line_start + Size::from_bytes(BYTES_PER_LINE) && i != alloc.size() {
             line_start = write_allocation_newline(w, line_start, &ascii, pos_width, prefix)?;
             ascii.clear();
         }
@@ -981,7 +1002,7 @@ fn write_user_type_annotations(
             "| {:?}: {:?} at {}",
             index.index(),
             annotation.user_ty,
-            tcx.sess.source_map().span_to_string(annotation.span)
+            tcx.sess.source_map().span_to_embeddable_string(annotation.span)
         )?;
     }
     if !body.user_type_annotations.is_empty() {
@@ -994,6 +1015,26 @@ pub fn dump_mir_def_ids(tcx: TyCtxt<'_>, single: Option<DefId>) -> Vec<DefId> {
     if let Some(i) = single {
         vec![i]
     } else {
-        tcx.mir_keys(LOCAL_CRATE).iter().map(|def_id| def_id.to_def_id()).collect()
+        tcx.mir_keys(()).iter().map(|def_id| def_id.to_def_id()).collect()
     }
+}
+
+/// Calc converted u64 decimal into hex and return it's length in chars
+///
+/// ```ignore (cannot-test-private-function)
+/// assert_eq!(1, hex_number_length(0));
+/// assert_eq!(1, hex_number_length(1));
+/// assert_eq!(2, hex_number_length(16));
+/// ```
+fn hex_number_length(x: u64) -> usize {
+    if x == 0 {
+        return 1;
+    }
+    let mut length = 0;
+    let mut x_left = x;
+    while x_left > 0 {
+        x_left /= 16;
+        length += 1;
+    }
+    length
 }

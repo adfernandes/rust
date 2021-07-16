@@ -39,15 +39,6 @@ struct CallSite<'tcx> {
 
 /// Returns true if MIR inlining is enabled in the current compilation session.
 crate fn is_enabled(tcx: TyCtxt<'_>) -> bool {
-    if tcx.sess.opts.debugging_opts.instrument_coverage {
-        // Since `Inline` happens after `InstrumentCoverage`, the function-specific coverage
-        // counters can be invalidated, such as by merging coverage counter statements from
-        // a pre-inlined function into a different function. This kind of change is invalid,
-        // so inlining must be skipped. Note: This check is performed here so inlining can
-        // be disabled without preventing other optimizations (regardless of `mir_opt_level`).
-        return false;
-    }
-
     if let Some(enabled) = tcx.sess.opts.debugging_opts.inline_mir {
         return enabled;
     }
@@ -66,7 +57,7 @@ impl<'tcx> MirPass<'tcx> for Inline {
         if inline(tcx, body) {
             debug!("running simplify cfg on {:?}", body.source);
             CfgSimplifier::new(body).simplify();
-            remove_dead_blocks(body);
+            remove_dead_blocks(tcx, body);
         }
     }
 }
@@ -293,7 +284,7 @@ impl Inliner<'tcx> {
         &self,
         callsite: &CallSite<'tcx>,
         callee_attrs: &CodegenFnAttrs,
-    ) -> Result<(), &'satic str> {
+    ) -> Result<(), &'static str> {
         if let InlineAttr::Never = callee_attrs.inline {
             return Err("never inline hint");
         }
@@ -416,7 +407,7 @@ impl Inliner<'tcx> {
 
                 TerminatorKind::Call { func: Operand::Constant(ref f), cleanup, .. } => {
                     if let ty::FnDef(def_id, substs) =
-                        *callsite.callee.subst_mir(self.tcx, &f.literal.ty).kind()
+                        *callsite.callee.subst_mir(self.tcx, &f.literal.ty()).kind()
                     {
                         let substs = self.tcx.normalize_erasing_regions(self.param_env, substs);
                         if let Ok(Some(instance)) =
@@ -637,8 +628,11 @@ impl Inliner<'tcx> {
                 // `required_consts`, here we may not only have `ConstKind::Unevaluated`
                 // because we are calling `subst_and_normalize_erasing_regions`.
                 caller_body.required_consts.extend(
-                    callee_body.required_consts.iter().copied().filter(|&constant| {
-                        matches!(constant.literal.val, ConstKind::Unevaluated(_, _, _))
+                    callee_body.required_consts.iter().copied().filter(|&ct| {
+                        match ct.literal.const_for_ty() {
+                            Some(ct) => matches!(ct.val, ConstKind::Unevaluated(_)),
+                            None => true,
+                        }
                     }),
                 );
             }
@@ -842,10 +836,11 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
 
     fn visit_span(&mut self, span: &mut Span) {
         let mut expn_data =
-            ExpnData::default(ExpnKind::Inlined, *span, self.tcx.sess.edition(), None);
+            ExpnData::default(ExpnKind::Inlined, *span, self.tcx.sess.edition(), None, None);
         expn_data.def_site = self.body_span;
         // Make sure that all spans track the fact that they were inlined.
-        *span = self.callsite_span.fresh_expansion(expn_data);
+        *span =
+            self.callsite_span.fresh_expansion(expn_data, self.tcx.create_stable_hashing_context());
     }
 
     fn visit_place(&mut self, place: &mut Place<'tcx>, context: PlaceContext, location: Location) {
