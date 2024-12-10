@@ -309,10 +309,10 @@ impl<'tcx> Visitor<'tcx> for CollectItemTypesVisitor<'tcx> {
                     self.tcx.ensure().type_of(param.def_id);
                     if let Some(default) = default {
                         // need to store default and type of default
+                        self.tcx.ensure().const_param_default(param.def_id);
                         if let hir::ConstArgKind::Anon(ac) = default.kind {
                             self.tcx.ensure().type_of(ac.def_id);
                         }
-                        self.tcx.ensure().const_param_default(param.def_id);
                     }
                 }
             }
@@ -1021,12 +1021,12 @@ impl<'tcx> FieldUniquenessCheckContext<'tcx> {
     }
 }
 
-fn lower_variant(
-    tcx: TyCtxt<'_>,
+fn lower_variant<'tcx>(
+    tcx: TyCtxt<'tcx>,
     variant_did: Option<LocalDefId>,
     ident: Ident,
     discr: ty::VariantDiscr,
-    def: &hir::VariantData<'_>,
+    def: &hir::VariantData<'tcx>,
     adt_kind: ty::AdtKind,
     parent_did: LocalDefId,
 ) -> ty::VariantDef {
@@ -1042,6 +1042,7 @@ fn lower_variant(
             name: f.ident.name,
             vis: tcx.visibility(f.def_id),
             safety: f.safety,
+            value: f.default.map(|v| v.def_id.to_def_id()),
         })
         .collect();
     let recovered = match def {
@@ -1817,7 +1818,6 @@ fn const_param_default<'tcx>(
         ),
     };
     let icx = ItemCtxt::new(tcx, def_id);
-    // FIXME(const_generics): investigate which places do and don't need const ty feeding
-    let ct = icx.lowerer().lower_const_arg(default_ct, FeedConstTy::No);
+    let ct = icx.lowerer().lower_const_arg(default_ct, FeedConstTy::Param(def_id.to_def_id()));
     ty::EarlyBinder::bind(ct)
 }
