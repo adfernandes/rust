@@ -794,7 +794,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     closure_def_id,
                     found_kind,
                     expected_kind,
-                    "async ",
+                    "Async",
                 );
                 self.note_obligation_cause(&mut err, &obligation);
                 self.point_at_returns_when_relevant(&mut err, &obligation);
@@ -1745,9 +1745,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     };
                     (
                         data.span,
-                        format!(
-                            "one version of crate `{crate_name}` is used here, as a {dependency}"
-                        ),
+                        format!("one version of crate `{crate_name}` used here, as a {dependency}"),
                     )
                 })
             {

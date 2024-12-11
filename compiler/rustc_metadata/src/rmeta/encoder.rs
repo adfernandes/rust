@@ -1389,12 +1389,23 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             // `ConstArgKind::Path`. We never actually access this `DefId`
             // anywhere so we don't need to encode it for other crates.
             if def_kind == DefKind::AnonConst
-                && matches!(
-                    tcx.hir_node_by_def_id(local_id),
-                    hir::Node::ConstArg(hir::ConstArg { kind: hir::ConstArgKind::Path(..), .. })
-                )
+                && match tcx.hir_node_by_def_id(local_id) {
+                    hir::Node::ConstArg(hir::ConstArg { kind, .. }) => match kind {
+                        // Skip encoding defs for these as they should not have had a `DefId` created
+                        hir::ConstArgKind::Path(..) | hir::ConstArgKind::Infer(..) => true,
+                        hir::ConstArgKind::Anon(..) => false,
+                    },
+                    _ => false,
+                }
             {
                 continue;
+            }
+
+            if def_kind == DefKind::Field
+                && let hir::Node::Field(field) = tcx.hir_node_by_def_id(local_id)
+                && let Some(anon) = field.default
+            {
+                record!(self.tables.default_fields[def_id] <- anon.def_id.to_def_id());
             }
 
             if should_encode_span(def_kind) {
@@ -1763,10 +1774,6 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             {
                 record!(self.tables.mir_coroutine_witnesses[def_id.to_def_id()] <- witnesses);
             }
-
-            let instance = ty::InstanceKind::Item(def_id.to_def_id());
-            let unused = tcx.unused_generic_params(instance);
-            self.tables.unused_generic_params.set(def_id.local_def_index, unused);
         }
 
         // Encode all the deduced parameter attributes for everything that has MIR, even for items

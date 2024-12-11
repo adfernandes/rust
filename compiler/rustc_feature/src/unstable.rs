@@ -394,6 +394,8 @@ declare_features! (
     (unstable, async_fn_track_caller, "1.73.0", Some(110011)),
     /// Allows `for await` loops.
     (unstable, async_for_loop, "1.77.0", Some(118898)),
+    /// Allows `async` trait bound modifier.
+    (unstable, async_trait_bounds, "CURRENT_RUSTC_VERSION", Some(62290)),
     /// Allows using C-variadics.
     (unstable, c_variadic, "1.34.0", Some(44930)),
     /// Allows the use of `#[cfg(<true/false>)]`.
@@ -453,6 +455,9 @@ declare_features! (
     (unstable, custom_test_frameworks, "1.30.0", Some(50297)),
     /// Allows declarative macros 2.0 (`macro`).
     (unstable, decl_macro, "1.17.0", Some(39412)),
+    /// Allows the use of default values on struct definitions and the construction of struct
+    /// literals with the functional update syntax without a base.
+    (unstable, default_field_values, "CURRENT_RUSTC_VERSION", Some(132162)),
     /// Allows using `#[deprecated_safe]` to deprecate the safeness of a function or trait
     (unstable, deprecated_safe, "1.61.0", Some(94978)),
     /// Allows having using `suggestion` in the `#[deprecated]` attribute.
@@ -497,14 +502,14 @@ declare_features! (
     (unstable, gen_blocks, "1.75.0", Some(117078)),
     /// Infer generic args for both consts and types.
     (unstable, generic_arg_infer, "1.55.0", Some(85077)),
-    /// An extension to the `generic_associated_types` feature, allowing incomplete features.
-    (incomplete, generic_associated_types_extended, "1.61.0", Some(95451)),
     /// Allows non-trivial generic constants which have to have wfness manually propagated to callers
     (incomplete, generic_const_exprs, "1.56.0", Some(76560)),
     /// Allows generic parameters and where-clauses on free & associated const items.
     (incomplete, generic_const_items, "1.73.0", Some(113521)),
     /// Allows registering static items globally, possibly across crates, to iterate over at runtime.
     (unstable, global_registration, "1.80.0", Some(125119)),
+    /// Allows using guards in patterns.
+    (incomplete, guard_patterns, "CURRENT_RUSTC_VERSION", Some(129967)),
     /// Allows using `..=X` as a patterns in slices.
     (unstable, half_open_range_patterns_in_slices, "1.66.0", Some(67264)),
     /// Allows `if let` guard in match arms.

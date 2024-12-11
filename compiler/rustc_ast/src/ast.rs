@@ -627,9 +627,11 @@ impl Pat {
             | PatKind::Or(s) => s.iter().for_each(|p| p.walk(it)),
 
             // Trivial wrappers over inner patterns.
-            PatKind::Box(s) | PatKind::Deref(s) | PatKind::Ref(s, _) | PatKind::Paren(s) => {
-                s.walk(it)
-            }
+            PatKind::Box(s)
+            | PatKind::Deref(s)
+            | PatKind::Ref(s, _)
+            | PatKind::Paren(s)
+            | PatKind::Guard(s, _) => s.walk(it),
 
             // These patterns do not contain subpatterns, skip.
             PatKind::Wild
@@ -838,6 +840,9 @@ pub enum PatKind {
 
     // A never pattern `!`.
     Never,
+
+    /// A guard pattern (e.g., `x if guard(x)`).
+    Guard(P<Pat>, P<Expr>),
 
     /// Parentheses in patterns used for grouping (i.e., `(PAT)`).
     Paren(P<Pat>),
@@ -2566,6 +2571,18 @@ pub enum SelfKind {
     Explicit(P<Ty>, Mutability),
 }
 
+impl SelfKind {
+    pub fn to_ref_suggestion(&self) -> String {
+        match self {
+            SelfKind::Region(None, mutbl) => mutbl.ref_prefix_str().to_string(),
+            SelfKind::Region(Some(lt), mutbl) => format!("&{lt} {}", mutbl.prefix_str()),
+            SelfKind::Value(_) | SelfKind::Explicit(_, _) => {
+                unreachable!("if we had an explicit self, we wouldn't be here")
+            }
+        }
+    }
+}
+
 pub type ExplicitSelf = Spanned<SelfKind>;
 
 impl Param {
@@ -3102,6 +3119,7 @@ pub struct FieldDef {
     pub ident: Option<Ident>,
 
     pub ty: P<Ty>,
+    pub default: Option<AnonConst>,
     pub is_placeholder: bool,
 }
 
