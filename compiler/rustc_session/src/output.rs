@@ -4,8 +4,7 @@ use std::path::Path;
 
 use rustc_ast::{self as ast, attr};
 use rustc_errors::FatalError;
-use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
+use rustc_span::{Span, Symbol, sym};
 
 use crate::Session;
 use crate::config::{self, CrateType, Input, OutFileName, OutputFilenames, OutputType};
@@ -87,7 +86,7 @@ pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute]) -> Symbol {
         }
     }
 
-    Symbol::intern("rust_out")
+    sym::rust_out
 }
 
 pub fn validate_crate_name(sess: &Session, s: Symbol, sp: Option<Span>) {

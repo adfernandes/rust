@@ -7,17 +7,18 @@ use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::lang_items::LangItem;
-use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_infer::infer::resolve::OpportunisticRegionResolver;
+use rustc_infer::infer::{DefineOpaqueTypes, RegionVariableOrigin};
 use rustc_infer::traits::{ObligationCauseCode, PredicateObligations};
 use rustc_middle::traits::select::OverflowError;
 use rustc_middle::traits::{BuiltinImplSource, ImplSource, ImplSourceUserDefinedData};
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
 use rustc_middle::ty::fold::TypeFoldable;
-use rustc_middle::ty::visit::{MaxUniverse, TypeVisitable, TypeVisitableExt};
+use rustc_middle::ty::visit::TypeVisitableExt;
 use rustc_middle::ty::{self, Term, Ty, TyCtxt, TypingMode, Upcast};
 use rustc_middle::{bug, span_bug};
-use rustc_span::symbol::sym;
+use rustc_span::sym;
+use thin_vec::thin_vec;
 use tracing::{debug, instrument};
 
 use super::{
@@ -60,6 +61,9 @@ enum ProjectionCandidate<'tcx> {
 
     /// Bounds specified on an object type
     Object(ty::PolyProjectionPredicate<'tcx>),
+
+    /// Built-in bound for a dyn async fn in trait
+    ObjectRpitit,
 
     /// From an "impl" (or a "pseudo-impl" returned by select)
     Select(Selection<'tcx>),
@@ -179,35 +183,11 @@ pub(super) fn poly_project_and_unify_term<'cx, 'tcx>(
 ) -> ProjectAndUnifyResult<'tcx> {
     let infcx = selcx.infcx;
     let r = infcx.commit_if_ok(|_snapshot| {
-        let old_universe = infcx.universe();
         let placeholder_predicate = infcx.enter_forall_and_leak_universe(obligation.predicate);
-        let new_universe = infcx.universe();
 
         let placeholder_obligation = obligation.with(infcx.tcx, placeholder_predicate);
         match project_and_unify_term(selcx, &placeholder_obligation) {
             ProjectAndUnifyResult::MismatchedProjectionTypes(e) => Err(e),
-            ProjectAndUnifyResult::Holds(obligations)
-                if old_universe != new_universe
-                    && selcx.tcx().features().generic_associated_types_extended() =>
-            {
-                // If the `generic_associated_types_extended` feature is active, then we ignore any
-                // obligations references lifetimes from any universe greater than or equal to the
-                // universe just created. Otherwise, we can end up with something like `for<'a> I: 'a`,
-                // which isn't quite what we want. Ideally, we want either an implied
-                // `for<'a where I: 'a> I: 'a` or we want to "lazily" check these hold when we
-                // instantiate concrete regions. There is design work to be done here; until then,
-                // however, this allows experimenting potential GAT features without running into
-                // well-formedness issues.
-                let new_obligations = obligations
-                    .into_iter()
-                    .filter(|obligation| {
-                        let mut visitor = MaxUniverse::new();
-                        obligation.predicate.visit_with(&mut visitor);
-                        visitor.max_universe() < new_universe
-                    })
-                    .collect();
-                Ok(ProjectAndUnifyResult::Holds(new_obligations))
-            }
             other => Ok(other),
         }
     });
@@ -768,7 +748,7 @@ fn assemble_candidates_from_trait_def<'cx, 'tcx>(
             let Some(clause) = clause.as_projection_clause() else {
                 return ControlFlow::Continue(());
             };
-            if clause.projection_def_id() != obligation.predicate.def_id {
+            if clause.item_def_id() != obligation.predicate.def_id {
                 return ControlFlow::Continue(());
             }
 
@@ -851,6 +831,17 @@ fn assemble_candidates_from_object_ty<'cx, 'tcx>(
         env_predicates,
         false,
     );
+
+    // `dyn Trait` automagically project their AFITs to `dyn* Future`.
+    if tcx.is_impl_trait_in_trait(obligation.predicate.def_id)
+        && let Some(out_trait_def_id) = data.principal_def_id()
+        && let rpitit_trait_def_id = tcx.parent(obligation.predicate.def_id)
+        && tcx
+            .supertrait_def_ids(out_trait_def_id)
+            .any(|trait_def_id| trait_def_id == rpitit_trait_def_id)
+    {
+        candidate_set.push_candidate(ProjectionCandidate::ObjectRpitit);
+    }
 }
 
 #[instrument(
@@ -871,7 +862,7 @@ fn assemble_candidates_from_predicates<'cx, 'tcx>(
         let bound_predicate = predicate.kind();
         if let ty::ClauseKind::Projection(data) = predicate.kind().skip_binder() {
             let data = bound_predicate.rebind(data);
-            if data.projection_def_id() != obligation.predicate.def_id {
+            if data.item_def_id() != obligation.predicate.def_id {
                 continue;
             }
 
@@ -1271,6 +1262,8 @@ fn confirm_candidate<'cx, 'tcx>(
         ProjectionCandidate::Select(impl_source) => {
             confirm_select_candidate(selcx, obligation, impl_source)
         }
+
+        ProjectionCandidate::ObjectRpitit => confirm_object_rpitit_candidate(selcx, obligation),
     };
 
     // When checking for cycle during evaluation, we compare predicates with
@@ -2055,6 +2048,45 @@ fn confirm_impl_candidate<'cx, 'tcx>(
     } else {
         assoc_ty_own_obligations(selcx, obligation, &mut nested);
         Progress { term: term.instantiate(tcx, args), obligations: nested }
+    }
+}
+
+fn confirm_object_rpitit_candidate<'cx, 'tcx>(
+    selcx: &mut SelectionContext<'cx, 'tcx>,
+    obligation: &ProjectionTermObligation<'tcx>,
+) -> Progress<'tcx> {
+    let tcx = selcx.tcx();
+    let mut obligations = thin_vec![];
+
+    // Compute an intersection lifetime for all the input components of this GAT.
+    let intersection =
+        selcx.infcx.next_region_var(RegionVariableOrigin::MiscVariable(obligation.cause.span));
+    for component in obligation.predicate.args {
+        match component.unpack() {
+            ty::GenericArgKind::Lifetime(lt) => {
+                obligations.push(obligation.with(tcx, ty::OutlivesPredicate(lt, intersection)));
+            }
+            ty::GenericArgKind::Type(ty) => {
+                obligations.push(obligation.with(tcx, ty::OutlivesPredicate(ty, intersection)));
+            }
+            ty::GenericArgKind::Const(_ct) => {
+                // Consts have no outlives...
+            }
+        }
+    }
+
+    Progress {
+        term: Ty::new_dynamic(
+            tcx,
+            tcx.item_bounds_to_existential_predicates(
+                obligation.predicate.def_id,
+                obligation.predicate.args,
+            ),
+            intersection,
+            ty::DynStar,
+        )
+        .into(),
+        obligations,
     }
 }
 
