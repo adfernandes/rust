@@ -70,7 +70,6 @@ impl GlobalState {
     /// are ready to do semantic work.
     pub(crate) fn is_quiescent(&self) -> bool {
         self.vfs_done
-            && self.last_reported_status.is_some()
             && !self.fetch_workspaces_queue.op_in_progress()
             && !self.fetch_build_data_queue.op_in_progress()
             && !self.fetch_proc_macros_queue.op_in_progress()
@@ -590,7 +589,7 @@ impl GlobalState {
             }
 
             watchers.extend(
-                iter::once(Config::user_config_path())
+                iter::once(Config::user_config_dir_path().as_deref())
                     .chain(self.workspaces.iter().map(|ws| ws.manifest().map(ManifestPath::as_ref)))
                     .flatten()
                     .map(|glob_pattern| lsp_types::FileSystemWatcher {
@@ -613,7 +612,11 @@ impl GlobalState {
         }
 
         let files_config = self.config.files();
-        let project_folders = ProjectFolders::new(&self.workspaces, &files_config.exclude);
+        let project_folders = ProjectFolders::new(
+            &self.workspaces,
+            &files_config.exclude,
+            Config::user_config_dir_path().as_deref(),
+        );
 
         if (self.proc_macro_clients.is_empty() || !same_workspaces)
             && self.config.expand_proc_macros()

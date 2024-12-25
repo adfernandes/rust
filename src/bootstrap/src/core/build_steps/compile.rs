@@ -57,41 +57,20 @@ impl Std {
         }
     }
 
-    pub fn force_recompile(compiler: Compiler, target: TargetSelection) -> Self {
-        Self {
-            target,
-            compiler,
-            crates: Default::default(),
-            force_recompile: true,
-            extra_rust_args: &[],
-            is_for_mir_opt_tests: false,
-        }
+    pub fn force_recompile(mut self, force_recompile: bool) -> Self {
+        self.force_recompile = force_recompile;
+        self
     }
 
-    pub fn new_for_mir_opt_tests(compiler: Compiler, target: TargetSelection) -> Self {
-        Self {
-            target,
-            compiler,
-            crates: Default::default(),
-            force_recompile: false,
-            extra_rust_args: &[],
-            is_for_mir_opt_tests: true,
-        }
+    #[allow(clippy::wrong_self_convention)]
+    pub fn is_for_mir_opt_tests(mut self, is_for_mir_opt_tests: bool) -> Self {
+        self.is_for_mir_opt_tests = is_for_mir_opt_tests;
+        self
     }
 
-    pub fn new_with_extra_rust_args(
-        compiler: Compiler,
-        target: TargetSelection,
-        extra_rust_args: &'static [&'static str],
-    ) -> Self {
-        Self {
-            target,
-            compiler,
-            crates: Default::default(),
-            force_recompile: false,
-            extra_rust_args,
-            is_for_mir_opt_tests: false,
-        }
+    pub fn extra_rust_args(mut self, extra_rust_args: &'static [&'static str]) -> Self {
+        self.extra_rust_args = extra_rust_args;
+        self
     }
 
     fn copy_extra_objects(
@@ -522,6 +501,11 @@ pub fn std_cargo(builder: &Builder<'_>, target: TargetSelection, stage: u32, car
     }
 
     let mut features = String::new();
+
+    if stage != 0 && builder.config.default_codegen_backend(target).as_deref() == Some("cranelift")
+    {
+        features += "compiler-builtins-no-f16-f128 ";
+    }
 
     if builder.no_std(target) == Some(true) {
         features += " compiler-builtins-mem";
@@ -1892,12 +1876,6 @@ impl Step for Assemble {
             });
         }
 
-        let lld_install = if builder.config.lld_enabled {
-            Some(builder.ensure(llvm::Lld { target: target_compiler.host }))
-        } else {
-            None
-        };
-
         let stage = target_compiler.stage;
         let host = target_compiler.host;
         let (host_info, dir_name) = if build_compiler.host == host {
@@ -1958,22 +1936,11 @@ impl Step for Assemble {
 
         copy_codegen_backends_to_sysroot(builder, build_compiler, target_compiler);
 
-        if let Some(lld_install) = lld_install {
-            let src_exe = exe("lld", target_compiler.host);
-            let dst_exe = exe("rust-lld", target_compiler.host);
-            builder.copy_link(&lld_install.join("bin").join(src_exe), &libdir_bin.join(dst_exe));
-            let self_contained_lld_dir = libdir_bin.join("gcc-ld");
-            t!(fs::create_dir_all(&self_contained_lld_dir));
-            let lld_wrapper_exe = builder.ensure(crate::core::build_steps::tool::LldWrapper {
-                compiler: build_compiler,
-                target: target_compiler.host,
+        if builder.config.lld_enabled {
+            builder.ensure(crate::core::build_steps::tool::LldWrapper {
+                build_compiler,
+                target_compiler,
             });
-            for name in crate::LLD_FILE_NAMES {
-                builder.copy_link(
-                    &lld_wrapper_exe,
-                    &self_contained_lld_dir.join(exe(name, target_compiler.host)),
-                );
-            }
         }
 
         if builder.config.llvm_enabled(target_compiler.host) && builder.config.llvm_tools_enabled {

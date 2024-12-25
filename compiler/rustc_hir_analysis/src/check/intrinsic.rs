@@ -8,8 +8,7 @@ use rustc_middle::bug;
 use rustc_middle::traits::{ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::def_id::LocalDefId;
-use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
+use rustc_span::{Span, Symbol, sym};
 
 use crate::check::check_function_signature;
 use crate::errors::{
@@ -87,6 +86,7 @@ pub fn intrinsic_operation_unsafety(tcx: TyCtxt<'_>, intrinsic_id: LocalDefId) -
         | sym::assert_inhabited
         | sym::assert_zero_valid
         | sym::assert_mem_uninitialized_valid
+        | sym::breakpoint
         | sym::size_of
         | sym::min_align_of
         | sym::needs_drop
@@ -641,7 +641,9 @@ pub fn check_intrinsic_type(
             | sym::simd_round
             | sym::simd_trunc => (1, 0, vec![param(0)], param(0)),
             sym::simd_fpowi => (1, 0, vec![param(0), tcx.types.i32], param(0)),
-            sym::simd_fma => (1, 0, vec![param(0), param(0), param(0)], param(0)),
+            sym::simd_fma | sym::simd_relaxed_fma => {
+                (1, 0, vec![param(0), param(0), param(0)], param(0))
+            }
             sym::simd_gather => (3, 0, vec![param(0), param(1), param(2)], param(0)),
             sym::simd_masked_load => (3, 0, vec![param(0), param(1), param(2)], param(2)),
             sym::simd_masked_store => (3, 0, vec![param(0), param(1), param(2)], tcx.types.unit),

@@ -1381,6 +1381,18 @@ pub unsafe fn prefetch_write_instruction<T>(_data: *const T, _locality: i32) {
 #[rustc_intrinsic]
 #[rustc_intrinsic_must_be_overridden]
 #[rustc_nounwind]
+#[cfg(not(bootstrap))]
+pub fn breakpoint() {
+    unreachable!()
+}
+
+/// Executes a breakpoint trap, for inspection by a debugger.
+///
+/// This intrinsic does not have a stable counterpart.
+#[rustc_intrinsic]
+#[rustc_intrinsic_must_be_overridden]
+#[rustc_nounwind]
+#[cfg(bootstrap)]
 pub unsafe fn breakpoint() {
     unreachable!()
 }
@@ -3565,34 +3577,44 @@ pub const fn discriminant_value<T>(_v: &T) -> <T as DiscriminantKind>::Discrimin
     unimplemented!()
 }
 
-extern "rust-intrinsic" {
-    /// Rust's "try catch" construct for unwinding. Invokes the function pointer `try_fn` with the
-    /// data pointer `data`, and calls `catch_fn` if unwinding occurs while `try_fn` runs.
-    ///
-    /// `catch_fn` must not unwind.
-    ///
-    /// The third argument is a function called if an unwind occurs (both Rust `panic` and foreign
-    /// unwinds). This function takes the data pointer and a pointer to the target- and
-    /// runtime-specific exception object that was caught.
-    ///
-    /// Note that in the case of a foreign unwinding operation, the exception object data may not be
-    /// safely usable from Rust, and should not be directly exposed via the standard library. To
-    /// prevent unsafe access, the library implementation may either abort the process or present an
-    /// opaque error type to the user.
-    ///
-    /// For more information, see the compiler's source, as well as the documentation for the stable
-    /// version of this intrinsic, `std::panic::catch_unwind`.
-    #[rustc_nounwind]
-    pub fn catch_unwind(try_fn: fn(*mut u8), data: *mut u8, catch_fn: fn(*mut u8, *mut u8)) -> i32;
+/// Rust's "try catch" construct for unwinding. Invokes the function pointer `try_fn` with the
+/// data pointer `data`, and calls `catch_fn` if unwinding occurs while `try_fn` runs.
+///
+/// `catch_fn` must not unwind.
+///
+/// The third argument is a function called if an unwind occurs (both Rust `panic` and foreign
+/// unwinds). This function takes the data pointer and a pointer to the target- and
+/// runtime-specific exception object that was caught.
+///
+/// Note that in the case of a foreign unwinding operation, the exception object data may not be
+/// safely usable from Rust, and should not be directly exposed via the standard library. To
+/// prevent unsafe access, the library implementation may either abort the process or present an
+/// opaque error type to the user.
+///
+/// For more information, see the compiler's source, as well as the documentation for the stable
+/// version of this intrinsic, `std::panic::catch_unwind`.
+#[rustc_intrinsic]
+#[rustc_intrinsic_must_be_overridden]
+#[rustc_nounwind]
+pub unsafe fn catch_unwind(
+    _try_fn: fn(*mut u8),
+    _data: *mut u8,
+    _catch_fn: fn(*mut u8, *mut u8),
+) -> i32 {
+    unreachable!()
+}
 
-    /// Emits a `nontemporal` store, which gives a hint to the CPU that the data should not be held
-    /// in cache. Except for performance, this is fully equivalent to `ptr.write(val)`.
-    ///
-    /// Not all architectures provide such an operation. For instance, x86 does not: while `MOVNT`
-    /// exists, that operation is *not* equivalent to `ptr.write(val)` (`MOVNT` writes can be reordered
-    /// in ways that are not allowed for regular writes).
-    #[rustc_nounwind]
-    pub fn nontemporal_store<T>(ptr: *mut T, val: T);
+/// Emits a `nontemporal` store, which gives a hint to the CPU that the data should not be held
+/// in cache. Except for performance, this is fully equivalent to `ptr.write(val)`.
+///
+/// Not all architectures provide such an operation. For instance, x86 does not: while `MOVNT`
+/// exists, that operation is *not* equivalent to `ptr.write(val)` (`MOVNT` writes can be reordered
+/// in ways that are not allowed for regular writes).
+#[rustc_intrinsic]
+#[rustc_intrinsic_must_be_overridden]
+#[rustc_nounwind]
+pub unsafe fn nontemporal_store<T>(_ptr: *mut T, _val: T) {
+    unreachable!()
 }
 
 /// See documentation of `<*const T>::offset_from` for details.
@@ -3773,7 +3795,7 @@ where
 /// See [`const_eval_select()`] for the rules and requirements around that intrinsic.
 pub(crate) macro const_eval_select {
     (
-        @capture { $($arg:ident : $ty:ty = $val:expr),* $(,)? } $( -> $ret:ty )? :
+        @capture$([$($binders:tt)*])? { $($arg:ident : $ty:ty = $val:expr),* $(,)? } $( -> $ret:ty )? :
         if const
             $(#[$compiletime_attr:meta])* $compiletime:block
         else
@@ -3781,7 +3803,7 @@ pub(crate) macro const_eval_select {
     ) => {
         // Use the `noinline` arm, after adding explicit `inline` attributes
         $crate::intrinsics::const_eval_select!(
-            @capture { $($arg : $ty = $val),* } $(-> $ret)? :
+            @capture$([$($binders)*])? { $($arg : $ty = $val),* } $(-> $ret)? :
             #[noinline]
             if const
                 #[inline] // prevent codegen on this function
@@ -3795,7 +3817,7 @@ pub(crate) macro const_eval_select {
     },
     // With a leading #[noinline], we don't add inline attributes
     (
-        @capture { $($arg:ident : $ty:ty = $val:expr),* $(,)? } $( -> $ret:ty )? :
+        @capture$([$($binders:tt)*])? { $($arg:ident : $ty:ty = $val:expr),* $(,)? } $( -> $ret:ty )? :
         #[noinline]
         if const
             $(#[$compiletime_attr:meta])* $compiletime:block
@@ -3803,12 +3825,12 @@ pub(crate) macro const_eval_select {
             $(#[$runtime_attr:meta])* $runtime:block
     ) => {{
         $(#[$runtime_attr])*
-        fn runtime($($arg: $ty),*) $( -> $ret )? {
+        fn runtime$(<$($binders)*>)?($($arg: $ty),*) $( -> $ret )? {
             $runtime
         }
 
         $(#[$compiletime_attr])*
-        const fn compiletime($($arg: $ty),*) $( -> $ret )? {
+        const fn compiletime$(<$($binders)*>)?($($arg: $ty),*) $( -> $ret )? {
             // Don't warn if one of the arguments is unused.
             $(let _ = $arg;)*
 
@@ -3820,14 +3842,14 @@ pub(crate) macro const_eval_select {
     // We support leaving away the `val` expressions for *all* arguments
     // (but not for *some* arguments, that's too tricky).
     (
-        @capture { $($arg:ident : $ty:ty),* $(,)? } $( -> $ret:ty )? :
+        @capture$([$($binders:tt)*])? { $($arg:ident : $ty:ty),* $(,)? } $( -> $ret:ty )? :
         if const
             $(#[$compiletime_attr:meta])* $compiletime:block
         else
             $(#[$runtime_attr:meta])* $runtime:block
     ) => {
         $crate::intrinsics::const_eval_select!(
-            @capture { $($arg : $ty = $arg),* } $(-> $ret)? :
+            @capture$([$($binders)*])? { $($arg : $ty = $arg),* } $(-> $ret)? :
             if const
                 $(#[$compiletime_attr])* $compiletime
             else
@@ -4099,6 +4121,7 @@ pub const fn variant_count<T>() -> usize {
 #[unstable(feature = "core_intrinsics", issue = "none")]
 #[rustc_intrinsic]
 #[rustc_intrinsic_must_be_overridden]
+#[rustc_intrinsic_const_stable_indirect]
 pub const unsafe fn size_of_val<T: ?Sized>(_ptr: *const T) -> usize {
     unreachable!()
 }
@@ -4114,6 +4137,7 @@ pub const unsafe fn size_of_val<T: ?Sized>(_ptr: *const T) -> usize {
 #[unstable(feature = "core_intrinsics", issue = "none")]
 #[rustc_intrinsic]
 #[rustc_intrinsic_must_be_overridden]
+#[rustc_intrinsic_const_stable_indirect]
 pub const unsafe fn min_align_of_val<T: ?Sized>(_ptr: *const T) -> usize {
     unreachable!()
 }

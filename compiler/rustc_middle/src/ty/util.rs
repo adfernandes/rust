@@ -389,7 +389,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     .delay_as_bug();
             }
 
-            dtor_candidate = Some((*item_id, self.constness(impl_did)));
+            dtor_candidate = Some((*item_id, self.impl_trait_header(impl_did).unwrap().constness));
         });
 
         let (did, constness) = dtor_candidate?;
@@ -1241,6 +1241,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::Foreign(_)
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
+            | ty::UnsafeBinder(_)
             | ty::Infer(_)
             | ty::Alias(..)
             | ty::Param(_)
@@ -1281,10 +1282,20 @@ impl<'tcx> Ty<'tcx> {
             | ty::Foreign(_)
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
+            | ty::UnsafeBinder(_)
             | ty::Infer(_)
             | ty::Alias(..)
             | ty::Param(_)
             | ty::Placeholder(_) => false,
+        }
+    }
+
+    /// Checks whether this type is an ADT that has unsafe fields.
+    pub fn has_unsafe_fields(self) -> bool {
+        if let ty::Adt(adt_def, ..) = self.kind() {
+            adt_def.all_fields().any(|x| x.safety.is_unsafe())
+        } else {
+            false
         }
     }
 
@@ -1312,6 +1323,9 @@ impl<'tcx> Ty<'tcx> {
             | ty::FnPtr(..)
             | ty::Infer(ty::FreshIntTy(_))
             | ty::Infer(ty::FreshFloatTy(_)) => AsyncDropGlueMorphology::Noop,
+
+            // FIXME(unsafe_binders):
+            ty::UnsafeBinder(_) => todo!(),
 
             ty::Tuple(tys) if tys.is_empty() => AsyncDropGlueMorphology::Noop,
             ty::Adt(adt_def, _) if adt_def.is_manually_drop() => AsyncDropGlueMorphology::Noop,
@@ -1513,7 +1527,7 @@ impl<'tcx> Ty<'tcx> {
                 false
             }
 
-            ty::Foreign(_) | ty::CoroutineWitness(..) | ty::Error(_) => false,
+            ty::Foreign(_) | ty::CoroutineWitness(..) | ty::Error(_) | ty::UnsafeBinder(_) => false,
         }
     }
 
@@ -1672,7 +1686,8 @@ pub fn needs_drop_components_with_async<'tcx>(
         | ty::Closure(..)
         | ty::CoroutineClosure(..)
         | ty::Coroutine(..)
-        | ty::CoroutineWitness(..) => Ok(smallvec![ty]),
+        | ty::CoroutineWitness(..)
+        | ty::UnsafeBinder(_) => Ok(smallvec![ty]),
     }
 }
 

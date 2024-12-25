@@ -1070,23 +1070,33 @@ impl Step for Tidy {
         }
 
         if builder.config.channel == "dev" || builder.config.channel == "nightly" {
-            builder.info("fmt check");
-            if builder.initial_rustfmt().is_none() {
-                let inferred_rustfmt_dir = builder.initial_sysroot.join("bin");
-                eprintln!(
-                    "\
+            if !builder.config.json_output {
+                builder.info("fmt check");
+                if builder.initial_rustfmt().is_none() {
+                    let inferred_rustfmt_dir = builder.initial_sysroot.join("bin");
+                    eprintln!(
+                        "\
 ERROR: no `rustfmt` binary found in {PATH}
 INFO: `rust.channel` is currently set to \"{CHAN}\"
 HELP: if you are testing a beta branch, set `rust.channel` to \"beta\" in the `config.toml` file
 HELP: to skip test's attempt to check tidiness, pass `--skip src/tools/tidy` to `x.py test`",
-                    PATH = inferred_rustfmt_dir.display(),
-                    CHAN = builder.config.channel,
+                        PATH = inferred_rustfmt_dir.display(),
+                        CHAN = builder.config.channel,
+                    );
+                    crate::exit!(1);
+                }
+                let all = false;
+                crate::core::build_steps::format::format(
+                    builder,
+                    !builder.config.cmd.bless(),
+                    all,
+                    &[],
                 );
-                crate::exit!(1);
+            } else {
+                eprintln!(
+                    "WARNING: `--json-output` is not supported on rustfmt, formatting will be skipped"
+                );
             }
-            let all = false;
-            crate::core::build_steps::format::format(builder, !builder.config.cmd.bless(), all, &[
-            ]);
         }
 
         builder.info("tidy check");
@@ -1708,7 +1718,7 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
 
         // ensure that `libproc_macro` is available on the host.
         if suite == "mir-opt" {
-            builder.ensure(compile::Std::new_for_mir_opt_tests(compiler, compiler.host));
+            builder.ensure(compile::Std::new(compiler, compiler.host).is_for_mir_opt_tests(true));
         } else {
             builder.ensure(compile::Std::new(compiler, compiler.host));
         }
@@ -1721,7 +1731,7 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
         let mut cmd = builder.tool_cmd(Tool::Compiletest);
 
         if suite == "mir-opt" {
-            builder.ensure(compile::Std::new_for_mir_opt_tests(compiler, target));
+            builder.ensure(compile::Std::new(compiler, target).is_for_mir_opt_tests(true));
         } else {
             builder.ensure(compile::Std::new(compiler, target));
         }
@@ -2432,7 +2442,9 @@ impl Step for ErrorIndex {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src/tools/error_index_generator")
+        // Also add `error-index` here since that is what appears in the error message
+        // when this fails.
+        run.path("src/tools/error_index_generator").alias("error-index")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -2624,6 +2636,11 @@ fn prepare_cargo_test(
     if builder.kind == Kind::Test && !builder.fail_fast {
         cargo.arg("--no-fail-fast");
     }
+
+    if builder.config.json_output {
+        cargo.arg("--message-format=json");
+    }
+
     match builder.doc_tests {
         DocTests::Only => {
             cargo.arg("--doc");
@@ -2720,7 +2737,7 @@ impl Step for Crate {
 
         // Prepare sysroot
         // See [field@compile::Std::force_recompile].
-        builder.ensure(compile::Std::force_recompile(compiler, compiler.host));
+        builder.ensure(compile::Std::new(compiler, compiler.host).force_recompile(true));
 
         // If we're not doing a full bootstrap but we're testing a stage2
         // version of libstd, then what we're actually testing is the libstd
@@ -2756,11 +2773,15 @@ impl Step for Crate {
             // `lib.rs` file, and a `lib.miri.rs` file exists in the same folder, we build that
             // instead. But crucially we only do that for the library, not the test builds.
             cargo.env("MIRI_REPLACE_LIBRS_IF_NOT_TEST", "1");
+            // std needs to be built with `-Zforce-unstable-if-unmarked`. For some reason the builder
+            // does not set this directly, but relies on the rustc wrapper to set it, and we are not using
+            // the wrapper -- hence we have to set it ourselves.
+            cargo.rustflag("-Zforce-unstable-if-unmarked");
             cargo
         } else {
             // Also prepare a sysroot for the target.
             if builder.config.build != target {
-                builder.ensure(compile::Std::force_recompile(compiler, target));
+                builder.ensure(compile::Std::new(compiler, target).force_recompile(true));
                 builder.ensure(RemoteCopyLibs { compiler, target });
             }
 
@@ -3536,10 +3557,10 @@ impl Step for CodegenGCC {
         let compiler = self.compiler;
         let target = self.target;
 
-        builder.ensure(compile::Std::new_with_extra_rust_args(compiler, target, &[
-            "-Csymbol-mangling-version=v0",
-            "-Cpanic=abort",
-        ]));
+        builder.ensure(
+            compile::Std::new(compiler, target)
+                .extra_rust_args(&["-Csymbol-mangling-version=v0", "-Cpanic=abort"]),
+        );
 
         // If we're not doing a full bootstrap but we're testing a stage2
         // version of libstd, then what we're actually testing is the libstd

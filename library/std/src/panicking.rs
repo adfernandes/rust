@@ -81,7 +81,9 @@ extern "C" fn __rust_foreign_exception() -> ! {
     rtabort!("Rust cannot catch foreign exceptions");
 }
 
+#[derive(Default)]
 enum Hook {
+    #[default]
     Default,
     Custom(Box<dyn Fn(&PanicHookInfo<'_>) + 'static + Sync + Send>),
 }
@@ -93,13 +95,6 @@ impl Hook {
             Hook::Default => Box::new(default_hook),
             Hook::Custom(hook) => hook,
         }
-    }
-}
-
-impl Default for Hook {
-    #[inline]
-    fn default() -> Hook {
-        Hook::Default
     }
 }
 
@@ -623,7 +618,7 @@ pub fn begin_panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
             // Lazily, the first time this gets called, run the actual string formatting.
             self.string.get_or_insert_with(|| {
                 let mut s = String::new();
-                let mut fmt = fmt::Formatter::new(&mut s);
+                let mut fmt = fmt::Formatter::new(&mut s, fmt::FormattingOptions::new());
                 let _err = fmt::Display::fmt(&inner, &mut fmt);
                 s
             })

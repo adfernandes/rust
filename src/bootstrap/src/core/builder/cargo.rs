@@ -1033,6 +1033,10 @@ impl Builder<'_> {
 
         if mode == Mode::Rustc {
             rustflags.arg("-Wrustc::internal");
+            // cfg(bootstrap) - remove this check when lint is in bootstrap compiler
+            if stage != 0 {
+                rustflags.arg("-Drustc::symbol_intern_string_literal");
+            }
             // FIXME(edition_2024): Change this to `-Wrust_2024_idioms` when all
             // of the individual lints are satisfied.
             rustflags.arg("-Wkeyword_idents_2024");
@@ -1199,6 +1203,11 @@ impl Builder<'_> {
             // even if we're not going to output debuginfo for the crate we're currently building,
             // so that it'll be available when downstream consumers of std try to use it.
             rustflags.arg("-Zinline-mir-preserve-debug");
+
+            // FIXME: always pass this after the next `#[cfg(bootstrap)]` update.
+            if compiler.stage != 0 {
+                rustflags.arg("-Zmir_strip_debuginfo=locals-in-tiny-functions");
+            }
         }
 
         Cargo {

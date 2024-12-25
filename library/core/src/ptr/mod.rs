@@ -84,7 +84,7 @@
 // ^ we use this term instead of saying that the produced reference must
 // be valid, as the validity of a reference is easily confused for the
 // validity of the thing it refers to, and while the two concepts are
-// closly related, they are not identical.
+// closely related, they are not identical.
 //!
 //! These rules apply even if the result is unused!
 //! (The part about being initialized is not yet fully decided, but until
@@ -200,7 +200,7 @@
 //!
 //! But it *is* still sound to:
 //!
-//! * Create a pointer without provenance from just an address (see [`ptr::dangling`]). Such a
+//! * Create a pointer without provenance from just an address (see [`without_provenance`]). Such a
 //!   pointer cannot be used for memory accesses (except for zero-sized accesses). This can still be
 //!   useful for sentinel values like `null` *or* to represent a tagged pointer that will never be
 //!   dereferenceable. In general, it is always sound for an integer to pretend to be a pointer "for
@@ -314,8 +314,8 @@
 //! }
 //! ```
 //!
-//! (Yes, if you've been using AtomicUsize for pointers in concurrent datastructures, you should
-//! be using AtomicPtr instead. If that messes up the way you atomically manipulate pointers,
+//! (Yes, if you've been using [`AtomicUsize`] for pointers in concurrent datastructures, you should
+//! be using [`AtomicPtr`] instead. If that messes up the way you atomically manipulate pointers,
 //! we would like to know why, and what needs to be done to fix it.)
 //!
 //! Situations where a valid pointer *must* be created from just an address, such as baremetal code
@@ -381,7 +381,8 @@
 //! [`with_addr`]: pointer::with_addr
 //! [`map_addr`]: pointer::map_addr
 //! [`addr`]: pointer::addr
-//! [`ptr::dangling`]: core::ptr::dangling
+//! [`AtomicUsize`]: crate::sync::atomic::AtomicUsize
+//! [`AtomicPtr`]: crate::sync::atomic::AtomicPtr
 //! [`expose_provenance`]: pointer::expose_provenance
 //! [`with_exposed_provenance`]: with_exposed_provenance
 //! [Miri]: https://github.com/rust-lang/miri
@@ -394,6 +395,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::cmp::Ordering;
+use crate::intrinsics::const_eval_select;
 use crate::marker::FnPtr;
 use crate::mem::{self, MaybeUninit, SizedTypeProperties};
 use crate::{fmt, hash, intrinsics, ub_checks};
@@ -1073,25 +1075,6 @@ pub const unsafe fn swap<T>(x: *mut T, y: *mut T) {
 #[rustc_const_unstable(feature = "const_swap_nonoverlapping", issue = "133668")]
 #[rustc_diagnostic_item = "ptr_swap_nonoverlapping"]
 pub const unsafe fn swap_nonoverlapping<T>(x: *mut T, y: *mut T, count: usize) {
-    #[allow(unused)]
-    macro_rules! attempt_swap_as_chunks {
-        ($ChunkTy:ty) => {
-            if mem::align_of::<T>() >= mem::align_of::<$ChunkTy>()
-                && mem::size_of::<T>() % mem::size_of::<$ChunkTy>() == 0
-            {
-                let x: *mut $ChunkTy = x.cast();
-                let y: *mut $ChunkTy = y.cast();
-                let count = count * (mem::size_of::<T>() / mem::size_of::<$ChunkTy>());
-                // SAFETY: these are the same bytes that the caller promised were
-                // ok, just typed as `MaybeUninit<ChunkTy>`s instead of as `T`s.
-                // The `if` condition above ensures that we're not violating
-                // alignment requirements, and that the division is exact so
-                // that we don't lose any bytes off the end.
-                return unsafe { swap_nonoverlapping_simple_untyped(x, y, count) };
-            }
-        };
-    }
-
     ub_checks::assert_unsafe_precondition!(
         check_language_ub,
         "ptr::swap_nonoverlapping requires that both pointer arguments are aligned and non-null \
@@ -1110,19 +1093,48 @@ pub const unsafe fn swap_nonoverlapping<T>(x: *mut T, y: *mut T, count: usize) {
         }
     );
 
-    // Split up the slice into small power-of-two-sized chunks that LLVM is able
-    // to vectorize (unless it's a special type with more-than-pointer alignment,
-    // because we don't want to pessimize things like slices of SIMD vectors.)
-    if mem::align_of::<T>() <= mem::size_of::<usize>()
-        && (!mem::size_of::<T>().is_power_of_two()
-            || mem::size_of::<T>() > mem::size_of::<usize>() * 2)
-    {
-        attempt_swap_as_chunks!(usize);
-        attempt_swap_as_chunks!(u8);
-    }
+    const_eval_select!(
+        @capture[T] { x: *mut T, y: *mut T, count: usize }:
+        if const {
+            // At compile-time we want to always copy this in chunks of `T`, to ensure that if there
+            // are pointers inside `T` we will copy them in one go rather than trying to copy a part
+            // of a pointer (which would not work).
+            // SAFETY: Same preconditions as this function
+            unsafe { swap_nonoverlapping_simple_untyped(x, y, count) }
+        } else {
+            macro_rules! attempt_swap_as_chunks {
+                ($ChunkTy:ty) => {
+                    if mem::align_of::<T>() >= mem::align_of::<$ChunkTy>()
+                        && mem::size_of::<T>() % mem::size_of::<$ChunkTy>() == 0
+                    {
+                        let x: *mut $ChunkTy = x.cast();
+                        let y: *mut $ChunkTy = y.cast();
+                        let count = count * (mem::size_of::<T>() / mem::size_of::<$ChunkTy>());
+                        // SAFETY: these are the same bytes that the caller promised were
+                        // ok, just typed as `MaybeUninit<ChunkTy>`s instead of as `T`s.
+                        // The `if` condition above ensures that we're not violating
+                        // alignment requirements, and that the division is exact so
+                        // that we don't lose any bytes off the end.
+                        return unsafe { swap_nonoverlapping_simple_untyped(x, y, count) };
+                    }
+                };
+            }
 
-    // SAFETY: Same preconditions as this function
-    unsafe { swap_nonoverlapping_simple_untyped(x, y, count) }
+            // Split up the slice into small power-of-two-sized chunks that LLVM is able
+            // to vectorize (unless it's a special type with more-than-pointer alignment,
+            // because we don't want to pessimize things like slices of SIMD vectors.)
+            if mem::align_of::<T>() <= mem::size_of::<usize>()
+            && (!mem::size_of::<T>().is_power_of_two()
+                || mem::size_of::<T>() > mem::size_of::<usize>() * 2)
+            {
+                attempt_swap_as_chunks!(usize);
+                attempt_swap_as_chunks!(u8);
+            }
+
+            // SAFETY: Same preconditions as this function
+            unsafe { swap_nonoverlapping_simple_untyped(x, y, count) }
+        }
+    )
 }
 
 /// Same behavior and safety conditions as [`swap_nonoverlapping`]

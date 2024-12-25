@@ -68,9 +68,10 @@ Further caveats that Miri users should be aware of:
   not support networking. System API support varies between targets; if you run
   on Windows it is a good idea to use `--target x86_64-unknown-linux-gnu` to get
   better support.
-* Weak memory emulation may [produce weak behaviors](https://github.com/rust-lang/miri/issues/2301)
-  when `SeqCst` fences are used that are not actually permitted by the Rust memory model, and it
-  cannot produce all behaviors possibly observable on real hardware.
+* Weak memory emulation is not complete: there are legal behaviors that Miri will never produce.
+  However, Miri produces many behaviors that are hard to observe on real hardware, so it can help
+  quite a bit in finding weak memory concurrency bugs. To be really sure about complicated atomic
+  code, use specialized tools such as [loom](https://github.com/tokio-rs/loom).
 
 Moreover, Miri fundamentally cannot ensure that your code is *sound*. [Soundness] is the property of
 never causing undefined behavior when invoked from arbitrary safe code, even in combination with
@@ -374,16 +375,19 @@ to Miri failing to detect cases of undefined behavior in a program.
 * `-Zmiri-disable-weak-memory-emulation` disables the emulation of some C++11 weak
   memory effects.
 * `-Zmiri-native-lib=<path to a shared object file>` is an experimental flag for providing support
-  for calling native functions from inside the interpreter via FFI. Functions not provided by that
-  file are still executed via the usual Miri shims.
-  **WARNING**: If an invalid/incorrect `.so` file is specified, this can cause Undefined Behavior in Miri itself!
-  And of course, Miri cannot do any checks on the actions taken by the native code.
-  Note that Miri has its own handling of file descriptors, so if you want to replace *some* functions
-  working on file descriptors, you will have to replace *all* of them, or the two kinds of
-  file descriptors will be mixed up.
-  This is **work in progress**; currently, only integer arguments and return values are
-  supported (and no, pointer/integer casts to work around this limitation will not work;
-  they will fail horribly). It also only works on Unix hosts for now.
+  for calling native functions from inside the interpreter via FFI. The flag is supported only on
+  Unix systems. Functions not provided by that file are still executed via the usual Miri shims.
+  **WARNING**: If an invalid/incorrect `.so` file is specified, this can cause Undefined Behavior in
+  Miri itself! And of course, Miri cannot do any checks on the actions taken by the native code.
+  Note that Miri has its own handling of file descriptors, so if you want to replace *some*
+  functions working on file descriptors, you will have to replace *all* of them, or the two kinds of
+  file descriptors will be mixed up. This is **work in progress**; currently, only integer and
+  pointers arguments and return values are supported and memory allocated by the native code cannot
+  be accessed from Rust (only the other way around). Native code must not spawn threads that keep
+  running in the background after the call has returned to Rust and that access Rust-allocated
+  memory. Finally, the flag is **unsound** in the sense that Miri stops tracking details such as
+  initialization and provenance on memory shared with native code, so it is easily possible to write
+  code that has UB which is missed by Miri.
 * `-Zmiri-measureme=<name>` enables `measureme` profiling for the interpreted program.
    This can be used to find which parts of your program are executing slowly under Miri.
    The profile is written out to a file inside a directory called `<name>`, and can be processed
