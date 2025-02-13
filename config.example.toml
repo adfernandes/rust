@@ -323,7 +323,7 @@
 #full-bootstrap = false
 
 # Set the bootstrap/download cache path. It is useful when building rust
-# repeatedly in a CI invironment.
+# repeatedly in a CI environment.
 #bootstrap-cache-path = /path/to/shared/cache
 
 # Enable a build of the extended Rust tool set which is not only the compiler
@@ -594,11 +594,6 @@
 
 # Whether to always use incremental compilation when building rustc
 #incremental = false
-
-# Build a multi-threaded rustc. This allows users to use parallel rustc
-# via the unstable option `-Z threads=n`.
-# This option is deprecated and always true.
-#parallel-compiler = true
 
 # The default linker that will be hard-coded into the generated
 # compiler for targets that don't specify a default linker explicitly

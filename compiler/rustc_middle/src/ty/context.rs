@@ -690,6 +690,7 @@ bidirectional_lang_item_map! {
     AsyncFnOnce,
     AsyncFnOnceOutput,
     AsyncIterator,
+    BikeshedGuaranteedNoDrop,
     CallOnceFuture,
     CallRefFuture,
     Clone,
@@ -1301,9 +1302,6 @@ pub struct TyCtxt<'tcx> {
     gcx: &'tcx GlobalCtxt<'tcx>,
 }
 
-// Explicitly implement `DynSync` and `DynSend` for `TyCtxt` to short circuit trait resolution.
-unsafe impl DynSend for TyCtxt<'_> {}
-unsafe impl DynSync for TyCtxt<'_> {}
 fn _assert_tcx_fields() {
     sync::assert_dyn_sync::<&'_ GlobalCtxt<'_>>();
     sync::assert_dyn_send::<&'_ GlobalCtxt<'_>>();

@@ -2011,14 +2011,18 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
         // Only pass correct values for these flags for the `run-make` suite as it
         // requires that a C++ compiler was configured which isn't always the case.
         if !builder.config.dry_run() && mode == "run-make" {
+            let mut cflags = builder.cc_handled_clags(target, CLang::C);
+            cflags.extend(builder.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::C));
+            let mut cxxflags = builder.cc_handled_clags(target, CLang::Cxx);
+            cxxflags.extend(builder.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::Cxx));
             cmd.arg("--cc")
                 .arg(builder.cc(target))
                 .arg("--cxx")
                 .arg(builder.cxx(target).unwrap())
                 .arg("--cflags")
-                .arg(builder.cflags(target, GitRepo::Rustc, CLang::C).join(" "))
+                .arg(cflags.join(" "))
                 .arg("--cxxflags")
-                .arg(builder.cflags(target, GitRepo::Rustc, CLang::Cxx).join(" "));
+                .arg(cxxflags.join(" "));
             copts_passed = true;
             if let Some(ar) = builder.ar(target) {
                 cmd.arg("--ar").arg(ar);
@@ -2738,7 +2742,7 @@ impl Step for Crate {
             cargo
         } else {
             // Also prepare a sysroot for the target.
-            if builder.config.build != target {
+            if !builder.is_builder_target(&target) {
                 builder.ensure(compile::Std::new(compiler, target).force_recompile(true));
                 builder.ensure(RemoteCopyLibs { compiler, target });
             }
