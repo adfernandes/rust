@@ -7,23 +7,16 @@
 use rustc_ast::ptr::P;
 use rustc_ast::visit::{self as ast_visit, Visitor, walk_list};
 use rustc_ast::{self as ast, HasAttrs};
-use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_feature::Features;
-use rustc_hir::{HirId, ItemLocalId, OwnerId};
-use rustc_middle::hir;
-use rustc_middle::lint::LintLevelSource;
 use rustc_middle::ty::{RegisteredTools, TyCtxt};
 use rustc_session::lint::{BufferedEarlyLint, LintBuffer, LintPass};
 use rustc_session::{Session, lint};
-use rustc_span::def_id::CRATE_DEF_ID;
 use rustc_span::{Ident, Span};
 use tracing::debug;
 
-use crate::builtin::UnsafeCode;
 use crate::context::{EarlyContext, LintContext, LintStore};
 use crate::passes::{EarlyLintPass, EarlyLintPassObject};
-use crate::{Level, LintId};
 
 pub(super) mod diagnostics;
 
@@ -326,6 +319,7 @@ pub fn check_ast_node<'a>(
     registered_tools: &RegisteredTools,
     lint_buffer: Option<LintBuffer>,
     builtin_lints: impl EarlyLintPass + 'static,
+    builtin_lints_2: Option<impl EarlyLintPass + 'static>,
     check_node: impl EarlyCheckNode<'a>,
 ) {
     let context = EarlyContext::new(
@@ -345,23 +339,8 @@ pub fn check_ast_node<'a>(
     if passes.is_empty() {
         if let Some(tcx) = tcx {
             if sess.opts.lint_cap.is_some_and(|cap| cap == lint::Allow) {
-                let lints_that_must_run = builtin_lints
-                    .get_lints()
-                    .into_iter()
-                    .filter(|lint| {
-                        let has_future_breakage = lint
-                            .future_incompatible
-                            .is_some_and(|fut| fut.reason.has_future_breakage());
-                        has_future_breakage || lint.eval_always
-                    })
-                    .collect::<Vec<_>>();
-                eprintln!(
-                    "LINT: must_run: {}, total: {}",
-                    lints_that_must_run.len(),
-                    builtin_lints.get_lints().len()
-                );
-                if !lints_that_must_run.is_empty() {
-                    check_ast_node_inner(sess, Some(tcx), check_node, context, UnsafeCode);
+                if let Some(builtin_lints_2) = builtin_lints_2 {
+                    check_ast_node_inner(sess, Some(tcx), check_node, context, builtin_lints_2);
                     return;
                 }
             }
