@@ -10,8 +10,8 @@ use rustc_ast::{self as ast, HasAttrs};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_feature::Features;
 use rustc_middle::ty::{RegisteredTools, TyCtxt};
-use rustc_session::Session;
 use rustc_session::lint::{BufferedEarlyLint, LintBuffer, LintPass};
+use rustc_session::{Session, lint};
 use rustc_span::{Ident, Span};
 use tracing::debug;
 
@@ -319,6 +319,7 @@ pub fn check_ast_node<'a>(
     registered_tools: &RegisteredTools,
     lint_buffer: Option<LintBuffer>,
     builtin_lints: impl EarlyLintPass + 'static,
+    builtin_lints_2: Option<impl EarlyLintPass + 'static>,
     check_node: impl EarlyCheckNode<'a>,
 ) {
     let context = EarlyContext::new(
@@ -336,6 +337,14 @@ pub fn check_ast_node<'a>(
     let passes =
         if pre_expansion { &lint_store.pre_expansion_passes } else { &lint_store.early_passes };
     if passes.is_empty() {
+        if let Some(tcx) = tcx {
+            if sess.opts.lint_cap.is_some_and(|cap| cap == lint::Allow) {
+                if let Some(builtin_lints_2) = builtin_lints_2 {
+                    check_ast_node_inner(sess, Some(tcx), check_node, context, builtin_lints_2);
+                    return;
+                }
+            }
+        }
         check_ast_node_inner(sess, tcx, check_node, context, builtin_lints);
     } else {
         let mut passes: Vec<_> = passes.iter().map(|mk_pass| (mk_pass)()).collect();
